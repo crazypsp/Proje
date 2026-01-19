@@ -76,9 +76,9 @@ namespace Proje.Data.Services
                         worksheet.Cells[row, 9].Value = transaction.EmployeeRole;
                         worksheet.Cells[row, 10].Value = transaction.Status.ToString();
                         worksheet.Cells[row, 11].Value = transaction.CreatedDate;
-                        worksheet.Cells[row, 12].Value = transaction.ApprovalDate;
-                        worksheet.Cells[row, 13].Value = transaction.UpdateDate;
-                        worksheet.Cells[row, 14].Value = transaction.RejectionDate;
+                        //worksheet.Cells[row, 12].Value = transaction.ApprovalDate;
+                        //worksheet.Cells[row, 13].Value = transaction.UpdateDate;
+                        //worksheet.Cells[row, 14].Value = transaction.RejectionDate;
                         worksheet.Cells[row, 15].Value = transaction.BankName;
                         worksheet.Cells[row, 16].Value = transaction.AccountNumber;
                         worksheet.Cells[row, 17].Value = transaction.Description;
@@ -88,9 +88,9 @@ namespace Proje.Data.Services
                         worksheet.Cells[row, 6].Style.Numberformat.Format = "#,##0.00";
                         worksheet.Cells[row, 7].Style.Numberformat.Format = "#,##0.00";
                         worksheet.Cells[row, 11].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
-                        worksheet.Cells[row, 12].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
-                        worksheet.Cells[row, 13].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
-                        worksheet.Cells[row, 14].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
+                        //worksheet.Cells[row, 12].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
+                        //worksheet.Cells[row, 13].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
+                        //worksheet.Cells[row, 14].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
                         worksheet.Cells[row, 18].Style.Numberformat.Format = "dd/MM/yyyy HH:mm:ss";
                     }
 

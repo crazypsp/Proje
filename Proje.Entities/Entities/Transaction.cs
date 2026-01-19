@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using System.Transactions;
 
 namespace Proje.Entities.Entities
 {
@@ -23,28 +22,46 @@ namespace Proje.Entities.Entities
         // Tutar Bilgileri
         public decimal RequestedAmount { get; set; }       // Talep Tutarı
         public decimal ResultAmount { get; set; }          // Sonuç Tutarı
+        public decimal PaymentAmount { get; set; }         // Ödeme Tutarı
+        public decimal? Commission { get; set; }           // Komisyon
 
         // Personel Bilgileri
         public string EmployeeName { get; set; }           // Personel Adı
         public string EmployeeRole { get; set; }           // Personel Rolü
 
         // Durum
-        public TransactionStatus Status { get; set; }
+        public string Status { get; set; }                 // "Onaylandı", "Reddedildi", vs.
 
-        // Tarihler
-        public DateTime CreatedDate { get; set; }          // Oluşturulma
-        public DateTime? ApprovalDate { get; set; }        // Onay
-        public DateTime? UpdateDate { get; set; }          // Güncelleme
-        public DateTime? RejectionDate { get; set; }       // Reddedildi
+        // Modal Detayları - Müşteri Bilgileri
+        public string TransactionId { get; set; }          // İşlem ID
+        public string UserId { get; set; }                 // Kullanıcı ID
+        public string Username { get; set; }               // Kullanıcı Adı
+        public string FullName { get; set; }               // İsim Soyisim
 
-        // Ekstra Bilgiler
+        // Modal Detayları - Banka Hesabı
         public string BankName { get; set; }
         public string AccountNumber { get; set; }
+        public string IBAN { get; set; }
+        public string AccountHolder { get; set; }
         public string Description { get; set; }
+        public string TransactionType { get; set; }
+
+        // Modal Detayları - Tarihler
+        public DateTime CreatedDate { get; set; }          // İşlem Oluşturma Tarihi
+        public DateTime? AcceptanceDate { get; set; }      // İşleme Kabul Tarihi
+        public DateTime? LastApprovalDate { get; set; }    // Son Onay Tarihi
+        public DateTime? LastRejectionDate { get; set; }   // Son İptal/Red Tarihi
+        public DateTime? LastUpdateDate { get; set; }      // Son Güncelleme Tarihi
+
+        // Ek Bilgiler
+        public bool HasModalDetails { get; set; }          // Modal detayları alındı mı?
+        public string ErrorMessage { get; set; }           // Hata mesajı
+        public string ModalFilePath { get; set; }          // TXT dosyasının yolu
 
         // Meta Bilgiler
         public DateTime ExtractionDate { get; set; }
         public int PageNumber { get; set; }
         public int RowIndex { get; set; }
+        public TimeSpan ProcessingTime { get; set; }       // İşlem süresi
     }
 }
