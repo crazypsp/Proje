@@ -52,6 +52,7 @@ namespace Proje.Entities.Entities
         public DateTime? LastApprovalDate { get; set; }    // Son Onay Tarihi
         public DateTime? LastRejectionDate { get; set; }   // Son İptal/Red Tarihi
         public DateTime? LastUpdateDate { get; set; }      // Son Güncelleme Tarihi
+        public string LastApprovalDateFormatted { get; set; }
 
         // Ek Bilgiler
         public bool HasModalDetails { get; set; }          // Modal detayları alındı mı?

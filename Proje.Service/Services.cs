@@ -1,20 +1,22 @@
-﻿using Microsoft.Playwright;
-using Proje.Core.Helpers;
-using Proje.Core.Interfaces;
-using Proje.Entities.Entities;
-using Proje.Enums;
-using Proje.Models;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.NetworkInformation;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Services;
 using Google.Apis.Sheets.v4;
 using Google.Apis.Sheets.v4.Data;
+using Microsoft.Playwright;
+using Proje.Core.Helpers;
+using Proje.Core.Interfaces;
+using Proje.Entities.Entities;
+using Proje.Models;
 
 namespace Proje.Service
 {
@@ -29,7 +31,11 @@ namespace Proje.Service
         private SheetsService _sheetsService;
         private const string SpreadsheetId = "1RstouLb99LwTTzyavcJi-j1B6E49tu9gNtOxpcrQywY";
         private const string SheetName = "İşlem";
-        private int _currentRow = 16; // 16. satırdan başlayarak
+        private int _currentRow = 16;
+        private CancellationTokenSource _processingCts;
+        private int _processedTransactionCount = 0;
+        private HashSet<string> _processedTransactionIds = new HashSet<string>();
+        private HashSet<string> _existingTransactionIds = new HashSet<string>();
 
         public WebAutomationService(LoginCredentials credentials, BrowserConfig browserConfig)
         {
@@ -48,7 +54,8 @@ namespace Proje.Service
                 _browser = await _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
                 {
                     Headless = _browserConfig.Headless,
-                    Timeout = _browserConfig.TimeoutSeconds * 1000
+                    Timeout = _browserConfig.TimeoutSeconds * 1000,
+                    Args = new[] { "--disable-blink-features=AutomationControlled" }
                 });
 
                 LoggerHelper.LogInformation("Context oluşturuluyor...");
@@ -59,13 +66,35 @@ namespace Proje.Service
                         Username = _credentials.BasicAuthUsername,
                         Password = _credentials.BasicAuthPassword
                     },
-                    UserAgent = _browserConfig.UserAgent
+                    UserAgent = _browserConfig.UserAgent,
+                    ViewportSize = new ViewportSize { Width = 1920, Height = 1080 },
+                    IgnoreHTTPSErrors = true
                 });
 
-                _page = await _context.NewPageAsync();
+                // Anti-bot önlemlerini atlatmak için
+                await _context.AddInitScriptAsync(@"
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['tr-TR', 'tr', 'en-US', 'en']
+                    });
+                ");
 
-                // Google Sheets servisini başlat
+                _page = await _context.NewPageAsync();
+                await _page.SetViewportSizeAsync(1920, 1080);
+
+                // Sayfa hata yönetimi
+                _page.PageError += (_, e) => LoggerHelper.LogError(null, $"Sayfa hatası: {e}");
+                _page.Crash += (_, _) => LoggerHelper.LogError(null, "Sayfa çöktü!");
+
                 await InitializeGoogleSheetsAsync();
+
+                // Excel'deki mevcut işlem ID'lerini yükle
+                await LoadExistingTransactionIdsAsync();
 
                 LoggerHelper.LogInformation("Web otomasyon servisi hazır!");
             }
@@ -82,50 +111,15 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation("Google Sheets servisi başlatılıyor...");
 
-                // 1. Dosya yolunu belirle (birkaç alternatif)
-                string credentialFilePath = null;
+                string credentialFilePath = GetCredentialsFilePath();
 
-                // Öncelikli: Proje.Service klasörü altındaki credentials klasöründen oku
-                string projectCredentialsPath = Path.Combine(
-                    AppDomain.CurrentDomain.BaseDirectory,
-                    "..", "..", "..", "..", // Proje.Service klasörüne çık
-                    "credentials",
-                    "google-service-account.json"
-                );
-
-                credentialFilePath = Path.GetFullPath(projectCredentialsPath);
-
-                // Alternatif: Çıktı dizinindeki credentials klasöründen oku
                 if (!File.Exists(credentialFilePath))
                 {
-                    credentialFilePath = Path.Combine(
-                        AppDomain.CurrentDomain.BaseDirectory,
-                        "credentials",
-                        "google-service-account.json"
-                    );
-                }
-
-                // Alternatif 2: Kullanıcının belirttiği tam yolu kullan
-                if (!File.Exists(credentialFilePath))
-                {
-                    credentialFilePath = @"C:\Users\yusuf\source\repos\Proje\Proje.Service\credentials\google-service-account.json";
-                }
-
-                // 2. Dosyanın var olduğunu kontrol et
-                if (!File.Exists(credentialFilePath))
-                {
-                    throw new FileNotFoundException(
-                        $"Google servis hesabı anahtarı bulunamadı!\n" +
-                        $"Aranan yol: {credentialFilePath}\n" +
-                        $"Çalışma dizini: {Environment.CurrentDirectory}\n" +
-                        $"Uygulama taban dizini: {AppDomain.CurrentDomain.BaseDirectory}"
-                    );
+                    throw new FileNotFoundException($"Google servis hesabı anahtarı bulunamadı!\nAranan yol: {credentialFilePath}");
                 }
 
                 LoggerHelper.LogInformation($"Google kimlik bilgileri yükleniyor: {credentialFilePath}");
-                LoggerHelper.LogInformation($"Dosya boyutu: {new FileInfo(credentialFilePath).Length} bytes");
 
-                // 3. JSON dosyasından kimlik bilgilerini yükle
                 GoogleCredential credential;
                 using (var stream = new FileStream(credentialFilePath, FileMode.Open, FileAccess.Read))
                 {
@@ -141,268 +135,160 @@ namespace Proje.Service
 
                 LoggerHelper.LogInformation("Google Sheets servisi başlatıldı.");
             }
-            catch (FileNotFoundException ex)
-            {
-                LoggerHelper.LogError(ex, "Kimlik bilgileri dosyası bulunamadı!");
-
-                // Ek bilgi: Olası dosya konumlarını kontrol et
-                LoggerHelper.LogInformation($"Mevcut çalışma dizini: {Environment.CurrentDirectory}");
-                LoggerHelper.LogInformation($"Uygulama taban dizini: {AppDomain.CurrentDomain.BaseDirectory}");
-
-                // Dosya arama
-                var searchPaths = new[]
-                {
-            @"credentials\google-service-account.json",
-            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "credentials", "google-service-account.json"),
-            Path.Combine(Environment.CurrentDirectory, "credentials", "google-service-account.json"),
-            @"C:\Users\yusuf\source\repos\Proje\Proje.Service\credentials\google-service-account.json"
-        };
-
-                foreach (var path in searchPaths)
-                {
-                    LoggerHelper.LogInformation($"Kontrol ediliyor: {path} -> {File.Exists(path)}");
-                }
-
-                throw;
-            }
             catch (Exception ex)
             {
                 LoggerHelper.LogError(ex, "Google Sheets servisi başlatma hatası");
-
-                // Ek hata detayları
-                if (ex.InnerException != null)
-                {
-                    LoggerHelper.LogError(ex.InnerException, "İç hata detayı:");
-                }
-
                 throw;
             }
         }
 
-        private async Task ListProtectedRangesAsync()
+        private async Task LoadExistingTransactionIdsAsync()
         {
             try
             {
-                LoggerHelper.LogInformation("Sayfadaki korumalar kontrol ediliyor...");
-
-                var spreadsheet = await _sheetsService.Spreadsheets.Get(SpreadsheetId).ExecuteAsync();
-                var sheet = spreadsheet.Sheets.FirstOrDefault(s => s.Properties.Title == SheetName);
-
-                if (sheet == null)
-                {
-                    //LoggerHelper.LogError($"'{SheetName}' sayfası bulunamadı!");
-                    return;
-                }
-
-                LoggerHelper.LogInformation($"Sayfa ID: {sheet.Properties.SheetId}");
-                LoggerHelper.LogInformation($"Sayfa başlığı: {sheet.Properties.Title}");
-
-                // Sayfadaki tüm korumalı aralıkları al
-                var protectedRanges = sheet.ProtectedRanges;
-
-                if (protectedRanges == null || protectedRanges.Count == 0)
-                {
-                    LoggerHelper.LogInformation("Sayfada korumalı aralık bulunamadı.");
-                }
-                else
-                {
-                    LoggerHelper.LogInformation($"Sayfada {protectedRanges.Count} adet korumalı aralık bulundu:");
-
-                    foreach (var protectedRange in protectedRanges)
-                    {
-                        LoggerHelper.LogInformation($"Koruma ID: {protectedRange.ProtectedRangeId}");
-                        LoggerHelper.LogInformation($"Açıklama: {protectedRange.Description}");
-
-                        if (protectedRange.Range != null)
-                        {
-                            LoggerHelper.LogInformation($"Aralık: Sayfa ID: {protectedRange.Range.SheetId}, " +
-                                $"Başlangıç Satır: {protectedRange.Range.StartRowIndex}, " +
-                                $"Bitiş Satır: {protectedRange.Range.EndRowIndex}, " +
-                                $"Başlangıç Sütun: {protectedRange.Range.StartColumnIndex}, " +
-                                $"Bitiş Sütun: {protectedRange.Range.EndColumnIndex}");
-
-                            // A16 hücresinin korunup korunmadığını kontrol et
-                            bool isA16Protected = IsCellProtected(16, 0, protectedRange); // A16 = satır 16, sütun A (0)
-                            if (isA16Protected)
-                            {
-                                //LoggerHelper.LogError($"A16 hücresi bu koruma ile korunuyor: {protectedRange.Description}");
-                            }
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                LoggerHelper.LogError(ex, "Koruma kontrol hatası");
-            }
-        }
-
-        private bool IsCellProtected(int row, int column, ProtectedRange protectedRange)
-        {
-            if (protectedRange.Range == null) return false;
-
-            // Not: Google Sheets API'de satır ve sütun indeksleri 0 tabanlı
-            // row = 16 → indeks 15 (16. satır)
-            // column = 0 → A sütunu
-
-            bool rowInRange = (protectedRange.Range.StartRowIndex == null ||
-                               row >= protectedRange.Range.StartRowIndex) &&
-                              (protectedRange.Range.EndRowIndex == null ||
-                               row < protectedRange.Range.EndRowIndex);
-
-            bool columnInRange = (protectedRange.Range.StartColumnIndex == null ||
-                                  column >= protectedRange.Range.StartColumnIndex) &&
-                                 (protectedRange.Range.EndColumnIndex == null ||
-                                  column < protectedRange.Range.EndColumnIndex);
-
-            return rowInRange && columnInRange;
-        }
-
-        private async Task<int> FindFirstEmptyRowInColumnAAsync()
-        {
-            try
-            {
-                var range = $"{SheetName}!A:A";
-                var request = _sheetsService.Spreadsheets.Values.Get(SpreadsheetId, range);
-                var response = await request.ExecuteAsync();
-
-                // Boş olan ilk satırı bul (0 tabanlı değil, 1 tabanlı satır numarası)
-                int firstEmptyRow = response.Values?.Count + 1 ?? 1;
-
-                // Eğer satır 1-15 arası doluysa ve 16 boşsa, 16'yı döndür
-                if (firstEmptyRow < 16)
-                {
-                    // 16. satırı kontrol et
-                    var checkRange = $"{SheetName}!A16:A16";
-                    var checkRequest = _sheetsService.Spreadsheets.Values.Get(SpreadsheetId, checkRange);
-                    var checkResponse = await checkRequest.ExecuteAsync();
-
-                    if (checkResponse.Values == null || checkResponse.Values.Count == 0)
-                    {
-                        return 16;
-                    }
-                    else
-                    {
-                        return firstEmptyRow;
-                    }
-                }
-
-                return firstEmptyRow;
-            }
-            catch
-            {
-                return 16;
-            }
-        }
-
-        private async Task TryAlternativeColumnAsync(Transaction transaction, string column)
-        {
-            try
-            {
-                LoggerHelper.LogInformation($"Alternatif sütun deneyimi: {column}");
-
-                var range = $"{SheetName}!{column}{_currentRow}";
-                var valueRange = new ValueRange
-                {
-                    Values = new List<IList<object>> { new List<object> { "ALT_TEST_" + DateTime.Now.ToString("HHmmss") } }
-                };
-
-                var request = _sheetsService.Spreadsheets.Values.Update(
-                    valueRange, SpreadsheetId, range);
-                request.ValueInputOption =
-                    SpreadsheetsResource.ValuesResource.UpdateRequest.ValueInputOptionEnum.USERENTERED;
-
-                var response = await request.ExecuteAsync();
-                LoggerHelper.LogInformation($"{column} sütunu yazılabilir! Güncellenen hücreler: {response.UpdatedCells}");
-            }
-            catch (Exception ex)
-            {
-                LoggerHelper.LogError(ex, $"{column} sütunu da korumalı!");
-            }
-        }
-
-
-        private async Task WriteTransactionToGoogleSheetAsync(Transaction transaction)
-        {
-            // SADECE ONAYLANMIŞ İŞLEMLERİ YAZ
-            if (transaction.Status != "Onaylandı")
-            {
-                LoggerHelper.LogInformation($"İşlem {transaction.TransactionNo} onaylanmamış ({transaction.Status}). Atlanıyor.");
-                return;
-            }
-
-            try
-            {
-                // 1. _sheetsService kontrolü
                 if (_sheetsService == null)
                 {
                     await InitializeGoogleSheetsAsync();
                 }
 
-                // 2. Boş satır bul (B sütununa göre)
-                int emptyRow = await FindFirstEmptyRowInColumnBAsync();
-                _currentRow = Math.Max(emptyRow, 16);
+                // H sütunundaki tüm ID'leri oku (16. satırdan itibaren)
+                var range = $"{SheetName}!H16:H";
+                var request = _sheetsService.Spreadsheets.Values.Get(SpreadsheetId, range);
+                var response = await request.ExecuteAsync();
 
-                LoggerHelper.LogInformation($"Onaylanmış işlem yazılıyor: {transaction.TransactionNo}, Satır: {_currentRow}");
-
-                // 3. SADECE BELİRLİ SÜTUNLARA YAZ (B, C, D, E, F, H)
-                // G sütunu atlanacak (H sütunu için yer açmak için)
-
-                // Range: B sütunundan H sütununa kadar
-                var range = $"{SheetName}!B{_currentRow}:H{_currentRow}";
-                var valueRange = new ValueRange();
-
-                // 7 sütunluk değer listesi (B, C, D, E, F, G, H)
-                // G sütunu boş bırakılacak
-                var values = new List<IList<object>>
-        {
-            new List<object>
-            {
-                // B: Son Onay Tarihi
-                transaction.LastApprovalDate?.ToString("dd/MM/yyyy HH:mm:ss") ?? DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"),
-                
-                // C: IBAN Sahibi
-                transaction.AccountHolder ?? "",
-                
-                // D: Banka Adı
-                transaction.BankName ?? "",
-                
-                // E: IBAN
-                transaction.IBAN ?? "",
-                
-                // F: Sonuç Tutar
-                transaction.ResultAmount.ToString("N2"),
-                
-                // G: BOŞ (atlanacak)
-                "",
-                
-                // H: İşlem ID
-                transaction.TransactionId ?? transaction.TransactionNo ?? ""
+                if (response.Values != null)
+                {
+                    foreach (var row in response.Values)
+                    {
+                        if (row.Count > 0 && !string.IsNullOrWhiteSpace(row[0].ToString()))
+                        {
+                            _existingTransactionIds.Add(row[0].ToString().Trim());
+                        }
+                    }
+                    LoggerHelper.LogInformation($"Google Sheets'ten {_existingTransactionIds.Count} adet mevcut işlem ID'si yüklendi.");
+                }
             }
-        };
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Mevcut işlem ID'lerini yükleme hatası");
+            }
+        }
 
-                valueRange.Values = values;
+        private string GetCredentialsFilePath()
+        {
+            var searchPaths = new[]
+            {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "credentials", "google-service-account.json"),
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "credentials", "google-service-account.json"),
+                @"C:\Users\yusuf\source\repos\Proje\Proje.Service\credentials\google-service-account.json"
+            };
 
-                // 4. Doğrudan güncelleme yap (Append değil, Update)
-                var updateRequest = _sheetsService.Spreadsheets.Values.Update(
-                    valueRange, SpreadsheetId, range);
-                updateRequest.ValueInputOption =
-                    SpreadsheetsResource.ValuesResource.UpdateRequest.ValueInputOptionEnum.USERENTERED;
+            foreach (var path in searchPaths)
+            {
+                var fullPath = Path.GetFullPath(path);
+                if (File.Exists(fullPath))
+                {
+                    return fullPath;
+                }
+            }
+            return searchPaths[0];
+        }
+
+        private async Task WriteTransactionToGoogleSheetAsync(Transaction transaction, string transactionType)
+        {
+            try
+            {
+                // 1. İşlem onaylandı mı kontrol et
+                if (transaction.Status != "Onaylandı")
+                {
+                    LoggerHelper.LogInformation($"İşlem {transaction.TransactionNo} onaylanmamış ({transaction.Status}). Atlanıyor.");
+                    return;
+                }
+
+                // 2. İşlem ID kontrolü (bellekte)
+                string transactionId = transaction.TransactionId ?? transaction.TransactionNo;
+                if (string.IsNullOrEmpty(transactionId))
+                {
+                    LoggerHelper.LogWarning($"İşlem ID bulunamadı: {transaction.TransactionNo}");
+                    return;
+                }
+
+                // 3. Daha önce işlenmiş mi?
+                if (_processedTransactionIds.Contains(transactionId))
+                {
+                    LoggerHelper.LogInformation($"İşlem {transactionId} zaten işlenmiş. Atlanıyor.");
+                    return;
+                }
+
+                // 4. Excel'de zaten var mı?
+                if (_existingTransactionIds.Contains(transactionId))
+                {
+                    LoggerHelper.LogInformation($"İşlem ID {transactionId} Google Sheets'te zaten mevcut. Atlanıyor.");
+                    return;
+                }
+
+                // 5. Tarihi GG.AA.YYYY formatına çevir
+                string transactionDate = "01.01.2001"; // Varsayılan tarih
+
+                // HTML'den Son Onay Tarihini al
+                if (!string.IsNullOrEmpty(transaction.LastApprovalDateFormatted))
+                {
+                    // "20.01.2026 22:00:42" formatından sadece tarihi al
+                    var dateParts = transaction.LastApprovalDateFormatted.Split(' ');
+                    if (dateParts.Length > 0)
+                    {
+                        transactionDate = dateParts[0];
+                    }
+                }
+
+                // 6. Tutarı işlem türüne göre ayarla
+                decimal amount = transaction.ResultAmount;
+                if (transactionType == "Çekim")
+                {
+                    amount = -amount;
+                }
+
+                // 7. Boş satır bul
+                int emptyRow = await FindFirstEmptyRowFromRow16Async();
+                _currentRow = emptyRow;
+
+                LoggerHelper.LogInformation($"Onaylanmış işlem yazılıyor: {transaction.TransactionNo}, Satır: {_currentRow}, Tür: {transactionType}");
+
+                // 8. Google Sheets'e yaz
+                var range = $"{SheetName}!B{_currentRow}:H{_currentRow}";
+                var valueRange = new ValueRange
+                {
+                    Values = new List<IList<object>>
+                    {
+                        new List<object>
+                        {
+                            transactionDate, // B sütunu: İşlem Tarihi (GG.AA.YYYY)
+                            transaction.FullName ?? "", // C sütunu: İsim Soyisim
+                            transaction.BankName ?? "", // D sütunu: Banka
+                            transaction.AccountHolder ?? "", // E sütunu: IBAN Sahibi
+                            amount.ToString("N2", CultureInfo.InvariantCulture), // F sütunu: İşlem Tutarı
+                            "", // G sütunu: Boş bırakıldı
+                            transactionId // H sütunu: İşlem ID (Key)
+                        }
+                    }
+                };
+
+                var updateRequest = _sheetsService.Spreadsheets.Values.Update(valueRange, SpreadsheetId, range);
+                updateRequest.ValueInputOption = SpreadsheetsResource.ValuesResource.UpdateRequest.ValueInputOptionEnum.USERENTERED;
 
                 var response = await updateRequest.ExecuteAsync();
-                LoggerHelper.LogInformation($"✅ İşlem {transaction.TransactionNo} başarıyla yazıldı. Satır: {_currentRow}, Sütunlar: B-H");
-                LoggerHelper.LogInformation($"   Güncellenen hücreler: {response.UpdatedCells}");
 
+                // 9. Başarılı kayıtları güncelle
+                _processedTransactionIds.Add(transactionId);
+                _existingTransactionIds.Add(transactionId);
                 _currentRow++;
+                _processedTransactionCount++;
+
+                LoggerHelper.LogInformation($"✅ İşlem {transactionId} başarıyla yazıldı. Satır: {_currentRow - 1}, Tutar: {amount:N2}");
             }
             catch (Google.GoogleApiException ex) when (ex.Message.Contains("protected cell"))
             {
-                // Korumalı hücre hatası - hangi sütunun korumalı olduğunu bul
-                LoggerHelper.LogError(ex, $"KORUMALI HÜCRE HATASI! Lütfen Google Sheets'te kontrol edin:");
-                LoggerHelper.LogError(ex, $"   - 'İşlem' sayfasındaki B{_currentRow}:H{_currentRow} aralığı");
-                LoggerHelper.LogError(ex, $"   - 'Veri' > 'Korumalı sayfalar ve aralıklar' menüsü");
-                LoggerHelper.LogError(ex, $"   - Servis hesabı izinleri: coreapi@heroic-bucksaw-484811-a2.iam.gserviceaccount.com");
-
+                LoggerHelper.LogError(ex, $"KORUMALI HÜCRE HATASI! B{_currentRow}:H{_currentRow} aralığı korumalı.");
                 throw;
             }
             catch (Exception ex)
@@ -412,59 +298,43 @@ namespace Proje.Service
             }
         }
 
-        // B sütunundaki ilk boş satırı bulan metod
-        // B sütunundaki ilk boş satırı bulan metod
-        private async Task<int> FindFirstEmptyRowInColumnBAsync()
+        private async Task<int> FindFirstEmptyRowFromRow16Async()
         {
             try
             {
-                var range = $"{SheetName}!B:B";
+                if (_sheetsService == null)
+                {
+                    await InitializeGoogleSheetsAsync();
+                }
+
+                // B sütununu 16. satırdan itibaren oku
+                var range = $"{SheetName}!B16:B";
                 var request = _sheetsService.Spreadsheets.Values.Get(SpreadsheetId, range);
                 var response = await request.ExecuteAsync();
 
-                // Boş olan ilk satırı bul (1 tabanlı)
-                int firstEmptyRow = response.Values?.Count + 1 ?? 1;
-
-                // Eğer 16'dan küçükse, 16. satır boş mu kontrol et
-                if (firstEmptyRow < 16)
+                if (response.Values == null)
                 {
-                    var checkRange = $"{SheetName}!B16:B16";
-                    var checkRequest = _sheetsService.Spreadsheets.Values.Get(SpreadsheetId, checkRange);
-                    var checkResponse = await checkRequest.ExecuteAsync();
+                    return 16; // Hiç veri yoksa 16. satır boştur
+                }
 
-                    if (checkResponse.Values == null || checkResponse.Values.Count == 0)
+                for (int i = 0; i < response.Values.Count; i++)
+                {
+                    var row = response.Values[i];
+                    if (row.Count == 0 || string.IsNullOrWhiteSpace(row[0].ToString()))
                     {
-                        return 16;
-                    }
-                    else
-                    {
-                        // 16 doluysa, bir sonraki boş satırı bul
-                        for (int row = 17; row <= 1000; row++)
-                        {
-                            var rowRange = $"{SheetName}!B{row}:B{row}";
-                            var rowRequest = _sheetsService.Spreadsheets.Values.Get(SpreadsheetId, rowRange);
-                            var rowResponse = await rowRequest.ExecuteAsync();
-
-                            if (rowResponse.Values == null || rowResponse.Values.Count == 0)
-                            {
-                                return row;
-                            }
-                        }
-                        return 1001; // Tüm satırlar dolu
+                        return 16 + i; // Boş satırın gerçek satır numarası
                     }
                 }
 
-                return firstEmptyRow;
+                // Tüm satırlar doluysa, son satırdan sonraki ilk satır
+                return 16 + response.Values.Count;
             }
-            catch
+            catch (Exception ex)
             {
-                return 16; // Varsayılan olarak 16 döndür
+                LoggerHelper.LogError(ex, "Boş satır bulma hatası");
+                return 16; // Hata durumunda 16. satıra yaz
             }
         }
-
-
-
-
 
         public async Task<bool> LoginAsync()
         {
@@ -472,44 +342,63 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation("Login işlemi başlatılıyor...");
 
-                // ADIM 1: 401 Basic Auth Geçişi
+                // Önce ana sayfaya git
                 await _page.GotoAsync("https://online.powerhavale.com/marjin/employee/69",
-                    new PageGotoOptions { Timeout = 10000, WaitUntil = WaitUntilState.NetworkIdle });
+                    new PageGotoOptions
+                    {
+                        Timeout = 30000,
+                        WaitUntil = WaitUntilState.NetworkIdle,
+                        Referer = "https://online.powerhavale.com/"
+                    });
 
-                // ADIM 2: Login Sayfasına Git
+                // Login sayfasına git
                 await _page.GotoAsync(_credentials.LoginUrl,
-                    new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
+                    new PageGotoOptions
+                    {
+                        Timeout = 30000,
+                        WaitUntil = WaitUntilState.NetworkIdle
+                    });
 
-                // ADIM 3: Login Formunu Doldur
-                await _page.FillAsync("input[name='email']", _credentials.FormUsername);
-                await _page.FillAsync("input[name='password']", _credentials.FormPassword);
+                // Email inputunu bul ve doldur
+                var emailInput = await _page.WaitForSelectorAsync("input[name='email'], input[type='email']",
+                    new PageWaitForSelectorOptions { Timeout = 10000 });
+                await emailInput.FillAsync(_credentials.FormUsername);
+                await Task.Delay(500);
 
-                // ADIM 4: Giriş Yap
-                await _page.ClickAsync("button[type='submit']");
+                // Password inputunu bul ve doldur
+                var passwordInput = await _page.WaitForSelectorAsync("input[name='password'], input[type='password']",
+                    new PageWaitForSelectorOptions { Timeout = 10000 });
+                await passwordInput.FillAsync(_credentials.FormPassword);
+                await Task.Delay(500);
 
-                // ADIM 5: Sayfanın Yüklenmesini Bekle
+                // Submit butonunu bul ve tıkla
+                var submitButton = await _page.WaitForSelectorAsync("button[type='submit'], button:has-text('Giriş'), button:has-text('Login')",
+                    new PageWaitForSelectorOptions { Timeout = 10000 });
+                await submitButton.ClickAsync();
+
+                // Giriş başarısını bekle
                 await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
-                await Task.Delay(2000);
+                await Task.Delay(3000);
 
-                // ADIM 6: Giriş Kontrolü
+                // Başarı kontrolü
                 var currentUrl = _page.Url;
                 var content = await _page.ContentAsync();
 
                 bool isLoginSuccess = !content.Contains("401 Authorization Required") &&
                                      !content.Contains("Hatalı") &&
                                      !content.Contains("Yanlış") &&
-                                     !currentUrl.Contains("login");
+                                     !currentUrl.Contains("login") &&
+                                     !currentUrl.Contains("auth") &&
+                                     (content.Contains("Dashboard") || content.Contains("Genel Bakış") || content.Contains("İşlem Geçmişi"));
 
                 if (isLoginSuccess)
                 {
-                    LoggerHelper.LogInformation($"Giriş başarılı! Yönlendirilen sayfa: {currentUrl}");
+                    LoggerHelper.LogInformation($"✅ Giriş başarılı! Yönlendirilen sayfa: {currentUrl}");
                     return true;
                 }
-                else
-                {
-                    LoggerHelper.LogWarning("Giriş başarısız!");
-                    return false;
-                }
+
+                LoggerHelper.LogWarning("Giriş başarısız!");
+                return false;
             }
             catch (Exception ex)
             {
@@ -524,19 +413,43 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation("İşlem Geçmişi sayfasına yönlendiriliyor...");
 
-                await _page.ClickAsync("a[href*='/marjin/transaction-history']");
-                await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
-                await Task.Delay(3000);
+                // Yan menüdeki "İşlem Geçmişi" linkini bul
+                var historyLink = await _page.WaitForSelectorAsync(
+                    "a[href*='transaction-history'], " +
+                    "a:has-text('İşlem Geçmişi'), " +
+                    "a:has-text('Transaction History')",
+                    new PageWaitForSelectorOptions { Timeout = 10000 });
 
-                var pageTitle = await _page.TitleAsync();
-                if (pageTitle.Contains("İşlem Geçmişi") ||
-                    await _page.ContentAsync().ContinueWith(t => t.Result.Contains("İşlem Geçmişi")))
+                if (historyLink != null)
                 {
-                    LoggerHelper.LogInformation("İşlem Geçmişi sayfasına ulaşıldı!");
-                    return true;
+                    await historyLink.ClickAsync();
+                    await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+                    await Task.Delay(3000);
+
+                    // Sayfa başlığını kontrol et
+                    var pageTitle = await _page.TitleAsync();
+                    var content = await _page.ContentAsync();
+
+                    if (pageTitle.Contains("İşlem Geçmişi") ||
+                        content.Contains("İşlem Geçmişi") ||
+                        content.Contains("transaction-history"))
+                    {
+                        LoggerHelper.LogInformation("✅ İşlem Geçmişi sayfasına ulaşıldı!");
+                        await Task.Delay(2000);
+                        return true;
+                    }
                 }
 
-                return false;
+                // Alternatif: URL'den direkt git
+                await _page.GotoAsync("https://online.powerhavale.com/marjin/transaction-history",
+                    new PageGotoOptions
+                    {
+                        Timeout = 30000,
+                        WaitUntil = WaitUntilState.NetworkIdle
+                    });
+
+                await Task.Delay(3000);
+                return true;
             }
             catch (Exception ex)
             {
@@ -545,111 +458,508 @@ namespace Proje.Service
             }
         }
 
-        public async Task<List<Transaction>> ExtractTransactionsAsync(int pageCount = 10)
+        private async Task ApplyFiltersAsync(string status = "Onaylandı", string transactionType = "Yatırım")
         {
-            var transactions = new List<Transaction>();
-
             try
             {
-                LoggerHelper.LogInformation($"Toplam {pageCount} sayfa işlem verisi çekiliyor...");
+                LoggerHelper.LogInformation($"Filtreler uygulanıyor: Durum={status}, İşlem Türü={transactionType}");
 
-                for (int pageNum = 1; pageNum <= pageCount; pageNum++)
-                {
-                    LoggerHelper.LogInformation($"Sayfa {pageNum} çekiliyor...");
+                // Filtre butonlarının yüklenmesini bekle
+                await Task.Delay(2000);
 
-                    var rows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
+                // 1. DURUM FİLTRESİNİ BUL VE UYGULA
+                await ApplyStatusFilterAsync(status);
+                await Task.Delay(1000);
 
-                    int rowIndex = 0;
-                    foreach (var row in rows)
-                    {
-                        try
-                        {
-                            var transaction = await ExtractTransactionFromRowAsync(row);
-                            if (transaction != null)
-                            {
-                                transaction.PageNumber = pageNum;
-                                transaction.RowIndex = rowIndex;
-                                transaction.ExtractionDate = DateTime.Now;
+                // 2. İŞLEM TÜRÜ FİLTRESİNİ BUL VE UYGULA
+                await ApplyTransactionTypeFilterAsync(transactionType);
+                await Task.Delay(1000);
 
-                                // SADECE ONAYLANMIŞ İŞLEMLERİN DETAYINI AL VE GOOGLE SHEETS'E YAZ
-                                if (transaction.Status == "Onaylandı")
-                                {
-                                    try
-                                    {
-                                        LoggerHelper.LogInformation($"{transaction.TransactionNo} numaralı işlemin detayları alınıyor...");
+                // 3. ARA BUTONUNU BUL VE TIKLA
+                await ClickSearchButtonAsync();
 
-                                        var detailButton = await row.QuerySelectorAsync("td:nth-child(7) button");
-                                        if (detailButton != null)
-                                        {
-                                            await detailButton.ClickAsync();
-                                            await Task.Delay(1500);
-
-                                            await ExtractModalDetailsAsync(transaction);
-                                            transaction.HasModalDetails = true;
-
-                                            // MODAL DETAYLARI ALINDI, ŞİMDİ GOOGLE SHEETS'E YAZ
-                                            await WriteTransactionToGoogleSheetAsync(transaction);
-
-                                            await CloseModalAsync();
-                                            await Task.Delay(500);
-                                        }
-                                        else
-                                        {
-                                            // Detay butonu yoksa bile, temel bilgilerle Google Sheets'e yaz
-                                            await WriteTransactionToGoogleSheetAsync(transaction);
-                                        }
-                                    }
-                                    catch (Exception modalEx)
-                                    {
-                                        LoggerHelper.LogError(modalEx, $"{transaction.TransactionNo} detay alma hatası");
-                                        await TryCloseModalAsync();
-
-                                        // Hata olsa bile, eldeki bilgilerle Google Sheets'e yazmayı dene
-                                        await WriteTransactionToGoogleSheetAsync(transaction);
-                                    }
-                                }
-                                else
-                                {
-                                    LoggerHelper.LogInformation($"{transaction.TransactionNo} onaylanmamış ({transaction.Status}). Google Sheets'e yazılmayacak.");
-                                }
-
-                                transactions.Add(transaction);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            LoggerHelper.LogError(ex, "Satır işleme hatası");
-                        }
-                        rowIndex++;
-                    }
-
-                    // Sonraki sayfaya git (eğer varsa)
-                    if (pageNum < pageCount)
-                    {
-                        var nextButton = await _page.QuerySelectorAsync("button[aria-label='Next page']");
-                        if (nextButton != null && await nextButton.IsVisibleAsync())
-                        {
-                            await nextButton.ClickAsync();
-                            await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
-                            await Task.Delay(2000);
-                        }
-                        else
-                        {
-                            LoggerHelper.LogInformation("Daha fazla sayfa bulunamadı.");
-                            break;
-                        }
-                    }
-                }
-
-                LoggerHelper.LogInformation($"{transactions.Count} adet işlem başarıyla çekildi!");
-                LoggerHelper.LogInformation($"Onaylanmış işlemler Google Sheets'e yazıldı.");
-                return transactions;
+                LoggerHelper.LogInformation($"✅ Filtreler başarıyla uygulandı: {status}, {transactionType}");
             }
             catch (Exception ex)
             {
-                LoggerHelper.LogError(ex, "İşlem verisi çekme hatası");
-                return transactions;
+                LoggerHelper.LogError(ex, "Filtre uygulama hatası");
+                throw;
             }
+        }
+
+        private async Task ApplyStatusFilterAsync(string status)
+        {
+            try
+            {
+                // Tüm combobox butonlarını bul
+                var comboboxes = await _page.QuerySelectorAllAsync(
+                    "button[role='combobox'][data-slot='select-trigger'], " +
+                    "button[role='combobox']");
+
+                foreach (var combobox in comboboxes)
+                {
+                    try
+                    {
+                        // Combobox içindeki metni kontrol et
+                        var span = await combobox.QuerySelectorAsync("span[data-slot='select-value']");
+                        if (span != null)
+                        {
+                            var currentText = await span.InnerTextAsync();
+
+                            // Eğer bu combobox'ın metni "Tümü", "Onaylandı", "Beklemede", "Reddedildi" vs ise bu durum combobox'ıdır
+                            if (currentText == "Tümü" ||
+                                currentText == "Onaylandı" ||
+                                currentText == "Beklemede" ||
+                                currentText == "Reddedildi")
+                            {
+                                LoggerHelper.LogInformation($"Durum combobox'ı bulundu: {currentText} -> {status} olarak değiştiriliyor");
+
+                                await combobox.ClickAsync();
+                                await Task.Delay(800);
+
+                                // Option listesini bekle
+                                await _page.WaitForSelectorAsync("[role='option'], [data-radix-select-viewport]",
+                                    new PageWaitForSelectorOptions { Timeout = 3000 });
+                                await Task.Delay(500);
+
+                                // İstenen option'ı bul ve tıkla
+                                var option = await _page.QuerySelectorAsync(
+                                    $"[role='option']:has-text('{status}'), " +
+                                    $"[data-radix-select-viewport] :text('{status}')");
+
+                                if (option != null)
+                                {
+                                    await option.ClickAsync();
+                                    LoggerHelper.LogInformation($"Durum '{status}' olarak ayarlandı.");
+                                }
+                                else
+                                {
+                                    LoggerHelper.LogWarning($"'{status}' seçeneği bulunamadı!");
+                                    await _page.Keyboard.PressAsync("Escape");
+                                }
+
+                                await Task.Delay(500);
+                                return; // İlk bulduğumuz durum combobox'ı ile işlem yap
+                            }
+                        }
+                    }
+                    catch { continue; }
+                }
+
+                LoggerHelper.LogWarning("Durum filtresi combobox'ı bulunamadı!");
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Durum filtresi ayarlama hatası");
+                throw;
+            }
+        }
+
+        private async Task ApplyTransactionTypeFilterAsync(string transactionType)
+        {
+            try
+            {
+                // Tüm combobox butonlarını bul
+                var comboboxes = await _page.QuerySelectorAllAsync(
+                    "button[role='combobox'][data-slot='select-trigger'], " +
+                    "button[role='combobox']");
+
+                foreach (var combobox in comboboxes)
+                {
+                    try
+                    {
+                        // Combobox içindeki metni kontrol et
+                        var span = await combobox.QuerySelectorAsync("span[data-slot='select-value']");
+                        if (span != null)
+                        {
+                            var currentText = await span.InnerTextAsync();
+
+                            // Eğer bu combobox'ın metni "Yatırım", "Çekim" ise bu işlem türü combobox'ıdır
+                            if (currentText == "Yatırım" ||
+                                currentText == "Çekim" ||
+                                currentText.Contains("Yatırım") ||
+                                currentText.Contains("Çekim"))
+                            {
+                                LoggerHelper.LogInformation($"İşlem türü combobox'ı bulundu: {currentText} -> {transactionType} olarak değiştiriliyor");
+
+                                await combobox.ClickAsync();
+                                await Task.Delay(800);
+
+                                // Option listesini bekle
+                                await _page.WaitForSelectorAsync("[role='option'], [data-radix-select-viewport]",
+                                    new PageWaitForSelectorOptions { Timeout = 3000 });
+                                await Task.Delay(500);
+
+                                // İstenen option'ı bul ve tıkla
+                                var option = await _page.QuerySelectorAsync(
+                                    $"[role='option']:has-text('{transactionType}'), " +
+                                    $"[data-radix-select-viewport] :text('{transactionType}')");
+
+                                if (option != null)
+                                {
+                                    await option.ClickAsync();
+                                    LoggerHelper.LogInformation($"İşlem türü '{transactionType}' olarak ayarlandı.");
+                                }
+                                else
+                                {
+                                    LoggerHelper.LogWarning($"'{transactionType}' seçeneği bulunamadı!");
+                                    await _page.Keyboard.PressAsync("Escape");
+                                }
+
+                                await Task.Delay(500);
+                                return; // İlk bulduğumuz işlem türü combobox'ı ile işlem yap
+                            }
+                        }
+                    }
+                    catch { continue; }
+                }
+
+                LoggerHelper.LogWarning("İşlem türü filtresi combobox'ı bulunamadı!");
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "İşlem türü filtresi ayarlama hatası");
+                throw;
+            }
+        }
+
+        private async Task ClickSearchButtonAsync()
+        {
+            try
+            {
+                // Ara butonunu bul (funnel icon'lu buton)
+                var searchButton = await _page.WaitForSelectorAsync(
+                    "button:has(svg.lucide-funnel), " +
+                    "button:has-text('Ara'), " +
+                    "[data-slot='button']:has(svg.lucide-funnel)",
+                    new PageWaitForSelectorOptions { Timeout = 5000 });
+
+                if (searchButton != null && await searchButton.IsVisibleAsync())
+                {
+                    LoggerHelper.LogInformation("Ara butonuna tıklanıyor...");
+                    await searchButton.ClickAsync();
+
+                    // Filtrelerin uygulanmasını bekle
+                    await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+                    await Task.Delay(3000);
+
+                    // Tablonun güncellendiğini kontrol et
+                    var tableRows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
+                    LoggerHelper.LogInformation($"✅ Filtreler uygulandı. {tableRows.Count} satır bulundu.");
+                }
+                else
+                {
+                    LoggerHelper.LogWarning("Ara butonu bulunamadı! Enter tuşunu deneyelim...");
+                    await _page.Keyboard.PressAsync("Enter");
+                    await Task.Delay(2000);
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Ara butonuna tıklama hatası");
+            }
+        }
+
+        public async Task<List<Transaction>> ExtractTransactionsWithFilterAsync(
+            string status = "Onaylandı",
+            string transactionType = "Yatırım",
+            bool autoPaginate = false)
+        {
+            var allTransactions = new List<Transaction>();
+            int currentPage = 1;
+            int maxPages = autoPaginate ? 100 : 1;
+
+            try
+            {
+                LoggerHelper.LogInformation($"Filtreli işlem çekme başlatılıyor: {status}, {transactionType}");
+
+                // 1. Önce sayfanın tamamen yüklendiğinden emin ol
+                await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+                await Task.Delay(2000);
+
+                // 2. Filtreleri uygula
+                await ApplyFiltersAsync(status, transactionType);
+                await Task.Delay(2000);
+
+                while (currentPage <= maxPages)
+                {
+                    try
+                    {
+                        LoggerHelper.LogInformation($"Sayfa {currentPage} işleniyor...");
+
+                        // 3. Tablonun yüklenmesini bekle
+                        await WaitForTableToLoadAsync();
+                        await Task.Delay(1000);
+
+                        // 4. Tablodaki satırları al
+                        var rows = await _page.QuerySelectorAllAsync(
+                            "tbody tr[data-slot='table-row'], " +
+                            "tbody tr");
+
+                        if (rows.Count == 0)
+                        {
+                            LoggerHelper.LogInformation("Sayfada işlem bulunamadı.");
+                            break;
+                        }
+
+                        LoggerHelper.LogInformation($"{rows.Count} adet satır bulundu.");
+
+                        // 5. Her satırı işle
+                        int newTransactions = 0;
+                        foreach (var row in rows)
+                        {
+                            try
+                            {
+                                var transaction = await ExtractTransactionFromRowAsync(row);
+                                if (transaction != null && transaction.Status == status)
+                                {
+                                    // Bu işlemi daha önce işledik mi kontrol et
+                                    if (_processedTransactionIds.Contains(transaction.TransactionId ?? transaction.TransactionNo))
+                                    {
+                                        LoggerHelper.LogInformation($"İşlem {transaction.TransactionNo} zaten işlenmiş, atlanıyor.");
+                                        continue;
+                                    }
+
+                                    // Modal detayları al (eğer buton varsa)
+                                    var detailButton = await row.QuerySelectorAsync(
+                                        "button[data-slot='sheet-trigger'], " +
+                                        "button:has-text('Detaylı Görüntüle'), " +
+                                        "td:nth-child(7) button");
+
+                                    if (detailButton != null && await detailButton.IsVisibleAsync())
+                                    {
+                                        await detailButton.ClickAsync();
+                                        await Task.Delay(2000); // Modal'ın yüklenmesi için daha fazla zaman
+                                        await ExtractModalDetailsAsync(transaction);
+                                        await CloseModalAsync();
+                                    }
+
+                                    // Google Sheets'e yaz
+                                    await WriteTransactionToGoogleSheetAsync(transaction, transactionType);
+                                    allTransactions.Add(transaction);
+                                    newTransactions++;
+                                    LoggerHelper.LogInformation($"✅ İşlem eklendi: {transaction.TransactionNo}");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                LoggerHelper.LogError(ex, "Satır işleme hatası");
+                            }
+                        }
+
+                        LoggerHelper.LogInformation($"Sayfa {currentPage}: {newTransactions} yeni işlem eklendi.");
+
+                        // 6. Sayfalar arası geçiş yapılacak mı?
+                        if (autoPaginate && currentPage < maxPages)
+                        {
+                            if (!await NavigateToNextPageAsync(currentPage))
+                            {
+                                LoggerHelper.LogInformation("Son sayfaya ulaşıldı veya sayfa geçişi başarısız.");
+                                break;
+                            }
+                            currentPage++;
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LoggerHelper.LogError(ex, $"Sayfa {currentPage} işleme hatası");
+                        break;
+                    }
+                }
+
+                LoggerHelper.LogInformation($"✅ {allTransactions.Count} adet işlem başarıyla çekildi! {currentPage} sayfa işlendi.");
+                return allTransactions;
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Filtreli işlem çekme hatası");
+                return allTransactions;
+            }
+        }
+
+        public async Task<List<Transaction>> ExtractTransactionsAsync(int pageCount = 10)
+        {
+            return await ExtractTransactionsWithFilterAsync("Onaylandı", "Yatırım", false);
+        }
+
+        private async Task<bool> NavigateToNextPageAsync(int currentPage)
+        {
+            try
+            {
+                LoggerHelper.LogInformation($"Sonraki sayfaya geçiliyor... (Mevcut: {currentPage})");
+
+                // HTML'deki pagination yapısını bul
+                var pagination = await _page.QuerySelectorAsync(
+                    "nav[role='navigation'][aria-label='pagination'], " +
+                    "[data-slot='pagination']");
+
+                if (pagination == null)
+                {
+                    LoggerHelper.LogWarning("Pagination yapısı bulunamadı.");
+                    return false;
+                }
+
+                // "Sonraki" butonunu bul
+                var nextButton = await pagination.QuerySelectorAsync(
+                    "a:has-text('Sonraki'), " +
+                    "button:has-text('Sonraki'), " +
+                    "[data-slot='pagination-link']:has-text('Sonraki'), " +
+                    "[aria-label*='next'], " +
+                    "[aria-label*='Next']");
+
+                if (nextButton != null && await nextButton.IsVisibleAsync())
+                {
+                    // Butonun disabled olup olmadığını kontrol et
+                    var isDisabled = await nextButton.EvaluateAsync<bool>(@"
+                        element => {
+                            if (element.disabled) return true;
+                            if (element.getAttribute('disabled') !== null) return true;
+                            if (element.getAttribute('aria-disabled') === 'true') return true;
+                            if (element.classList.contains('disabled')) return true;
+                            if (element.classList.contains('pointer-events-none')) return true;
+                            if (window.getComputedStyle(element).pointerEvents === 'none') return true;
+                            if (window.getComputedStyle(element).opacity === '0.5') return true;
+                            return false;
+                        }
+                    ");
+
+                    if (!isDisabled)
+                    {
+                        LoggerHelper.LogInformation("Sonraki sayfa butonu bulundu, tıklanıyor...");
+                        await nextButton.ClickAsync();
+
+                        // Yeni sayfanın yüklenmesini bekle
+                        await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+                        await Task.Delay(3000);
+
+                        // Tablonun yeni verilerle dolmasını bekle
+                        await WaitForTableToLoadAsync();
+
+                        LoggerHelper.LogInformation("✅ Sayfa başarıyla değişti.");
+                        return true;
+                    }
+                    else
+                    {
+                        LoggerHelper.LogInformation("Sonraki sayfa butonu devre dışı (muhtemelen son sayfadayız).");
+                        return false;
+                    }
+                }
+                else
+                {
+                    LoggerHelper.LogWarning("Sonraki sayfa butonu bulunamadı veya görünür değil.");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Sonraki sayfaya geçme hatası");
+                return false;
+            }
+        }
+
+        private async Task WaitForTableToLoadAsync(int timeoutSeconds = 10)
+        {
+            try
+            {
+                LoggerHelper.LogInformation("Tablo yüklenmesi bekleniyor...");
+
+                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+                while (stopwatch.Elapsed.TotalSeconds < timeoutSeconds)
+                {
+                    // Tablo body'sini kontrol et
+                    var tbody = await _page.QuerySelectorAsync(
+                        "tbody[data-slot='table-body'], " +
+                        "tbody");
+
+                    if (tbody != null)
+                    {
+                        // Satırları kontrol et
+                        var rows = await tbody.QuerySelectorAllAsync(
+                            "tr[data-slot='table-row'], " +
+                            "tr");
+
+                        if (rows.Count > 0)
+                        {
+                            LoggerHelper.LogInformation($"✅ Tablo yüklendi. {rows.Count} satır bulundu.");
+                            return;
+                        }
+                    }
+
+                    await Task.Delay(500);
+                }
+
+                LoggerHelper.LogWarning($"Tablo yüklenmesi {timeoutSeconds} saniye içinde tamamlanamadı.");
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Tablo yüklenmesi beklenirken hata");
+            }
+        }
+
+        public async Task ProcessTransactionsCycleAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    LoggerHelper.LogInformation("=== YENİ İŞLEM DÖNGÜSÜ BAŞLATILIYOR ===");
+
+                    // İşlenen işlem listesini temizle (isteğe bağlı)
+                    _processedTransactionCount = 0;
+
+                    // 1. Yatırım işlemlerini işle
+                    LoggerHelper.LogInformation("=== YATIRIM İŞLEMLERİ İŞLENİYOR ===");
+                    var yatirimTransactions = await ExtractTransactionsWithFilterAsync(
+                        status: "Onaylandı",
+                        transactionType: "Yatırım",
+                        autoPaginate: true);
+
+                    LoggerHelper.LogInformation($"{yatirimTransactions.Count} adet Yatırım işlemi işlendi.");
+
+                    // 2. Çekim işlemlerini işle
+                    LoggerHelper.LogInformation("=== ÇEKİM İŞLEMLERİ İŞLENİYOR ===");
+                    var cekimTransactions = await ExtractTransactionsWithFilterAsync(
+                        status: "Onaylandı",
+                        transactionType: "Çekim",
+                        autoPaginate: true);
+
+                    LoggerHelper.LogInformation($"{cekimTransactions.Count} adet Çekim işlemi işlendi.");
+
+                    // 3. Toplam işlem sayısını logla
+                    int totalTransactions = yatirimTransactions.Count + cekimTransactions.Count;
+                    LoggerHelper.LogInformation($"=== TOPLAM İŞLENEN İŞLEM: {totalTransactions} ===");
+
+                    // 4. İşlem sayısını sıfırla (bir sonraki döngü için)
+                    _processedTransactionCount = 0;
+
+                    // 5. 5 dakika bekle
+                    LoggerHelper.LogInformation("5 dakika bekleniyor...");
+                    await Task.Delay(TimeSpan.FromMinutes(5), cancellationToken);
+                }
+                catch (Exception ex) when (!(ex is TaskCanceledException))
+                {
+                    LoggerHelper.LogError(ex, "İşlem döngüsünde hata. 1 dakika sonra tekrar denenecek.");
+                    await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken);
+                }
+            }
+        }
+
+        public void StartContinuousProcessing()
+        {
+            _processingCts = new CancellationTokenSource();
+            var processingTask = ProcessTransactionsCycleAsync(_processingCts.Token);
+            LoggerHelper.LogInformation("Sürekli işlem döngüsü başlatıldı.");
+        }
+
+        public void StopContinuousProcessing()
+        {
+            _processingCts?.Cancel();
+            LoggerHelper.LogInformation("Sürekli işlem döngüsü durduruldu.");
         }
 
         private async Task<Transaction> ExtractTransactionFromRowAsync(IElementHandle row)
@@ -658,7 +968,7 @@ namespace Proje.Service
             {
                 var transaction = new Transaction();
 
-                // 1. İşlem No
+                // 1. İşlem No (3 buton: yeşil, turuncu, mavi)
                 var transactionNoElements = await row.QuerySelectorAllAsync("td:nth-child(1) button");
                 if (transactionNoElements.Count >= 3)
                 {
@@ -690,15 +1000,24 @@ namespace Proje.Service
                 var employeeCell = await row.QuerySelectorAsync("td:nth-child(4)");
                 if (employeeCell != null)
                 {
-                    transaction.EmployeeName = "pHantom";
-                    transaction.EmployeeRole = "Sistem";
+                    var employeeText = await employeeCell.InnerTextAsync();
+                    if (!string.IsNullOrWhiteSpace(employeeText))
+                    {
+                        var lines = employeeText.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                        transaction.EmployeeName = lines.Length > 0 ? lines[0].Trim() : "";
+                        transaction.EmployeeRole = lines.Length > 1 ? lines[1].Trim() : "";
+                    }
                 }
 
                 // 5. Durum
                 var statusCell = await row.QuerySelectorAsync("td:nth-child(5)");
                 if (statusCell != null)
                 {
-                    var statusBadge = await statusCell.QuerySelectorAsync("[data-slot='badge']");
+                    var statusBadge = await statusCell.QuerySelectorAsync(
+                        "[data-slot='badge'], " +
+                        ".badge, " +
+                        "span.badge");
+
                     if (statusBadge != null)
                     {
                         transaction.Status = (await statusBadge.InnerTextAsync()).Trim();
@@ -729,7 +1048,7 @@ namespace Proje.Service
         {
             try
             {
-                var textElement = await button.QuerySelectorAsync("p");
+                var textElement = await button.QuerySelectorAsync("p, span, div");
                 if (textElement != null)
                 {
                     return (await textElement.InnerTextAsync()).Trim();
@@ -753,11 +1072,12 @@ namespace Proje.Service
                     .Replace("₺", "")
                     .Replace("TL", "")
                     .Replace(" ", "")
+                    .Replace(".", "")
                     .Trim();
 
-                if (cleanText.Contains(".") && cleanText.Contains(","))
+                if (cleanText.Contains(","))
                 {
-                    cleanText = cleanText.Replace(".", "").Replace(",", ".");
+                    cleanText = cleanText.Replace(",", ".");
                 }
 
                 return decimal.Parse(cleanText, CultureInfo.InvariantCulture);
@@ -782,6 +1102,23 @@ namespace Proje.Service
                         var dateStr = line.Replace("Oluşturulma:", "").Trim();
                         transaction.CreatedDate = ParseTurkishDateTime(dateStr);
                     }
+                    else if (line.Contains("Onay:"))
+                    {
+                        var dateStr = line.Replace("Onay:", "").Trim();
+                        transaction.LastApprovalDate = ParseTurkishDateTime(dateStr);
+                    }
+                    else if (line.Contains("Güncelleme:"))
+                    {
+                        // İsteğe bağlı: güncelleme tarihini kaydet
+                    }
+                    else if (line.Contains("Reddedildi:"))
+                    {
+                        var dateStr = line.Replace("Reddedildi:", "").Trim();
+                        if (dateStr != "-")
+                        {
+                            transaction.LastRejectionDate = ParseTurkishDateTime(dateStr);
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -794,8 +1131,8 @@ namespace Proje.Service
         {
             try
             {
-                var formats = new[] { "dd/MM/yyyy HH:mm:ss", "dd.MM.yyyy HH:mm:ss" };
-                return DateTime.ParseExact(dateTimeStr, formats, CultureInfo.InvariantCulture, DateTimeStyles.None);
+                var formats = new[] { "dd/MM/yyyy HH:mm:ss", "dd.MM.yyyy HH:mm:ss", "dd/MM/yyyy", "dd.MM.yyyy" };
+                return DateTime.ParseExact(dateTimeStr.Trim(), formats, CultureInfo.InvariantCulture, DateTimeStyles.None);
             }
             catch
             {
@@ -807,21 +1144,25 @@ namespace Proje.Service
         {
             try
             {
-                var modal = await _page.QuerySelectorAsync("[role='dialog'], .modal, [data-slot='sheet-content']");
+                var modal = await _page.QuerySelectorAsync(
+                    "[role='dialog'], " +
+                    "[data-slot='sheet-content'], " +
+                    ".modal, " +
+                    ".dialog");
+
                 if (modal == null)
                 {
                     LoggerHelper.LogWarning("Modal bulunamadı!");
                     return;
                 }
 
-                await Task.Delay(1500);
-                await ExtractPaymentDetailsAsync(modal, transaction);
-                await ExtractCustomerInfoAsync(modal, transaction);
-                await ExtractBankAccountInfoAsync(modal, transaction);
-                await ExtractOtherInfoAsync(modal, transaction);
-                await WriteModalToTextFileAsync(modal, transaction);
+                // Modal içeriğini HTML olarak al
+                var modalHtml = await modal.InnerHTMLAsync();
 
-                LoggerHelper.LogInformation($"{transaction.TransactionNo} detayları alındı ve kaydedildi.");
+                // HTML'den gerekli verileri parse et
+                ParseModalHtml(modalHtml, transaction);
+
+                LoggerHelper.LogInformation($"{transaction.TransactionNo} modal detayları alındı.");
             }
             catch (Exception ex)
             {
@@ -829,247 +1170,90 @@ namespace Proje.Service
             }
         }
 
-        private async Task ExtractPaymentDetailsAsync(IElementHandle modal, Transaction transaction)
+        private void ParseModalHtml(string modalHtml, Transaction transaction)
         {
             try
             {
-                var paymentAmountElement = await modal.QuerySelectorAsync("p:text('Ödeme Tutarı') + div .font-medium");
-                if (paymentAmountElement != null)
+                // 1. İşlem ID (H sütunu)
+                var transactionIdMatch = System.Text.RegularExpressions.Regex.Match(
+                    modalHtml,
+                    @"İşlem ID.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+
+                if (transactionIdMatch.Success)
                 {
-                    var paymentText = await paymentAmountElement.InnerTextAsync();
-                    transaction.PaymentAmount = ParseAmount(paymentText.Split('\n')[0].Trim());
+                    transaction.TransactionId = transactionIdMatch.Groups[1].Value.Trim();
                 }
 
-                var resultAmountElement = await modal.QuerySelectorAsync("p:text('Sonuç Tutarı') + div .font-medium");
-                if (resultAmountElement != null)
-                {
-                    var resultText = await resultAmountElement.InnerTextAsync();
-                    transaction.ResultAmount = ParseAmount(resultText.Trim());
-                }
-            }
-            catch (Exception ex)
-            {
-                LoggerHelper.LogError(ex, "Ödeme detayları alma hatası");
-            }
-        }
+                // 2. İsim Soyisim (C sütunu)
+                var fullNameMatch = System.Text.RegularExpressions.Regex.Match(
+                    modalHtml,
+                    @"İsim Soyisim.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
 
-        private async Task ExtractCustomerInfoAsync(IElementHandle modal, Transaction transaction)
-        {
-            try
-            {
-                var transactionIdElement = await modal.QuerySelectorAsync("p:text('İşlem ID') + div .font-medium");
-                if (transactionIdElement != null)
+                if (fullNameMatch.Success)
                 {
-                    transaction.TransactionId = (await transactionIdElement.InnerTextAsync()).Trim();
+                    transaction.FullName = fullNameMatch.Groups[1].Value.Trim();
                 }
 
-                var userIdElement = await modal.QuerySelectorAsync("p:text('Kullanıcı ID') + div .font-medium");
-                if (userIdElement != null)
+                // 3. Banka (D sütunu) - img'den sonraki div'deki metin
+                var bankMatch = System.Text.RegularExpressions.Regex.Match(
+                    modalHtml,
+                    @"<img[^>]+>.*?<div class=""flex flex-col gap-1 text-right mr-8"">.*?<div></div>.*?<div>([^<]+)</div>",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+
+                if (bankMatch.Success)
                 {
-                    transaction.UserId = (await userIdElement.InnerTextAsync()).Trim();
+                    transaction.BankName = bankMatch.Groups[1].Value.Trim();
                 }
 
-                var usernameElement = await modal.QuerySelectorAsync("p:text('Kullanıcı Adı') + div .font-medium");
-                if (usernameElement != null)
+                // 4. IBAN Sahibi (E sütunu)
+                var ibanHolderMatch = System.Text.RegularExpressions.Regex.Match(
+                    modalHtml,
+                    @"IBAN Sahibi.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+
+                if (ibanHolderMatch.Success)
                 {
-                    transaction.Username = (await usernameElement.InnerTextAsync()).Trim();
+                    transaction.AccountHolder = ibanHolderMatch.Groups[1].Value.Trim();
                 }
 
-                var fullNameElement = await modal.QuerySelectorAsync("p:text('İsim Soyisim') + div .font-medium");
-                if (fullNameElement != null)
+                // 5. Sonuç Tutarı (F sütunu)
+                var amountMatch = System.Text.RegularExpressions.Regex.Match(
+                    modalHtml,
+                    @"Sonuç Tutarı.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+
+                if (amountMatch.Success)
                 {
-                    transaction.FullName = (await fullNameElement.InnerTextAsync()).Trim();
-                }
-            }
-            catch (Exception ex)
-            {
-                LoggerHelper.LogError(ex, "Müşteri bilgileri alma hatası");
-            }
-        }
-
-        private async Task ExtractBankAccountInfoAsync(IElementHandle modal, Transaction transaction)
-        {
-            try
-            {
-                var bankNameElement = await modal.QuerySelectorAsync("h3:text('Atanan Banka Hesabı') + div .flex-col div:nth-child(2)");
-                if (bankNameElement != null)
-                {
-                    transaction.BankName = (await bankNameElement.InnerTextAsync()).Trim();
-                }
-
-                var ibanHolderElement = await modal.QuerySelectorAsync("p:text('IBAN Sahibi') + div .font-medium");
-                if (ibanHolderElement != null)
-                {
-                    transaction.AccountHolder = (await ibanHolderElement.InnerTextAsync()).Trim();
-                }
-
-                var ibanElement = await modal.QuerySelectorAsync("p:text('IBAN') + div .font-medium");
-                if (ibanElement != null)
-                {
-                    transaction.IBAN = (await ibanElement.InnerTextAsync()).Trim();
-                }
-            }
-            catch (Exception ex)
-            {
-                LoggerHelper.LogError(ex, "Banka hesap bilgileri alma hatası");
-            }
-        }
-
-        private async Task ExtractOtherInfoAsync(IElementHandle modal, Transaction transaction)
-        {
-            try
-            {
-                var creationDateElement = await modal.QuerySelectorAsync("p:text('İşlem Oluşturma Tarihi') + div .font-medium");
-                if (creationDateElement != null)
-                {
-                    var dateText = (await creationDateElement.InnerTextAsync()).Trim();
-                    transaction.CreatedDate = ParseTurkishDateTime(dateText);
-                }
-
-                var acceptanceDateElement = await modal.QuerySelectorAsync("p:text('İşleme Kabul Tarihi') + div .font-medium");
-                if (acceptanceDateElement != null)
-                {
-                    var dateText = (await acceptanceDateElement.InnerTextAsync()).Trim();
-                    transaction.AcceptanceDate = ParseTurkishDateTime(dateText);
-                }
-
-                var lastApprovalDateElement = await modal.QuerySelectorAsync("p:text('Son Onay Tarihi') + div .font-medium");
-                if (lastApprovalDateElement != null)
-                {
-                    var dateText = (await lastApprovalDateElement.InnerTextAsync()).Trim();
-                    transaction.LastApprovalDate = ParseTurkishDateTime(dateText);
-                }
-
-                var lastRejectionDateElement = await modal.QuerySelectorAsync("p:text('Son İptal/Red Tarihi') + div .font-medium");
-                if (lastRejectionDateElement != null)
-                {
-                    var dateText = (await lastRejectionDateElement.InnerTextAsync()).Trim();
-                    if (dateText != "-")
-                        transaction.LastRejectionDate = ParseTurkishDateTime(dateText);
-                }
-
-                var lastUpdateDateElement = await modal.QuerySelectorAsync("p:text('Son Güncelleme Tarihi') + div .font-medium");
-                if (lastUpdateDateElement != null)
-                {
-                    var dateText = (await lastUpdateDateElement.InnerTextAsync()).Trim();
-                    transaction.LastUpdateDate = ParseTurkishDateTime(dateText);
-                }
-            }
-            catch (Exception ex)
-            {
-                LoggerHelper.LogError(ex, "Diğer bilgiler alma hatası");
-            }
-        }
-
-        private async Task WriteModalToTextFileAsync(IElementHandle modal, Transaction transaction)
-        {
-            try
-            {
-                string modalFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ModalLogs");
-                if (!Directory.Exists(modalFolder))
-                    Directory.CreateDirectory(modalFolder);
-
-                var modalText = await modal.InnerTextAsync();
-                string fileName = $"Modal_{transaction.TransactionNo}_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
-                string filePath = Path.Combine(modalFolder, fileName);
-
-                using (StreamWriter writer = new StreamWriter(filePath, false, Encoding.UTF8))
-                {
-                    writer.WriteLine("=".PadRight(80, '='));
-                    writer.WriteLine($"İŞLEM MODAL DETAYLARI - {DateTime.Now:dd.MM.yyyy HH:mm:ss}");
-                    writer.WriteLine("=".PadRight(80, '='));
-                    writer.WriteLine();
-
-                    writer.WriteLine($"İşlem No: {transaction.TransactionNo}");
-                    writer.WriteLine($"External Ref No: {transaction.ExternalRefNo}");
-                    writer.WriteLine($"Customer Ref No: {transaction.CustomerRefNo}");
-                    writer.WriteLine($"Müşteri: {transaction.CustomerName}");
-                    writer.WriteLine($"Talep Tutarı: {transaction.RequestedAmount:N2} ₺");
-                    writer.WriteLine($"Sonuç Tutarı: {transaction.ResultAmount:N2} ₺");
-                    writer.WriteLine($"Durum: {transaction.Status}");
-                    writer.WriteLine();
-
-                    writer.WriteLine("ÖDEME BİLGİLERİ:");
-                    writer.WriteLine($"- Ödeme Tutarı: {transaction.PaymentAmount:N2} ₺");
-                    writer.WriteLine($"- Sonuç Tutarı: {transaction.ResultAmount:N2} ₺");
-                    writer.WriteLine();
-
-                    writer.WriteLine("MÜŞTERİ BİLGİLERİ:");
-                    writer.WriteLine($"- İşlem ID: {transaction.TransactionId}");
-                    writer.WriteLine($"- Kullanıcı ID: {transaction.UserId}");
-                    writer.WriteLine($"- Kullanıcı Adı: {transaction.Username}");
-                    writer.WriteLine($"- İsim Soyisim: {transaction.FullName}");
-                    writer.WriteLine();
-
-                    writer.WriteLine("BANKA HESAP BİLGİLERİ:");
-                    writer.WriteLine($"- Banka Adı: {transaction.BankName}");
-                    writer.WriteLine($"- IBAN Sahibi: {transaction.AccountHolder}");
-                    writer.WriteLine($"- IBAN: {transaction.IBAN}");
-                    writer.WriteLine();
-
-                    writer.WriteLine("DİĞER BİLGİLER:");
-                    writer.WriteLine($"- İşlem Oluşturma: {transaction.CreatedDate:dd.MM.yyyy HH:mm:ss}");
-                    writer.WriteLine($"- İşleme Kabul: {transaction.AcceptanceDate:dd.MM.yyyy HH:mm:ss}");
-                    writer.WriteLine($"- Son Onay: {transaction.LastApprovalDate:dd.MM.yyyy HH:mm:ss}");
-                    writer.WriteLine($"- Son Red/İptal: {(transaction.LastRejectionDate.HasValue ? transaction.LastRejectionDate.Value.ToString("dd.MM.yyyy HH:mm:ss") : "-")}");
-                    writer.WriteLine($"- Son Güncelleme: {transaction.LastUpdateDate:dd.MM.yyyy HH:mm:ss}");
-                    writer.WriteLine();
-
-                    writer.WriteLine("-".PadRight(80, '-'));
-                    writer.WriteLine("MODAL TAM METİN İÇERİĞİ:");
-                    writer.WriteLine("-".PadRight(80, '-'));
-                    writer.WriteLine(modalText);
-
-                    writer.WriteLine();
-                    writer.WriteLine("=".PadRight(80, '='));
-                    writer.WriteLine($"Dosya Oluşturulma: {DateTime.Now:dd.MM.yyyy HH:mm:ss}");
-                    writer.WriteLine($"Dosya Yolu: {filePath}");
-                    writer.WriteLine("=".PadRight(80, '='));
-                }
-
-                LoggerHelper.LogInformation($"Modal verileri TXT dosyasına yazıldı: {filePath}");
-                await AppendToDailyLogFileAsync(transaction, modalText);
-            }
-            catch (Exception ex)
-            {
-                LoggerHelper.LogError(ex, "TXT dosyasına yazma hatası");
-            }
-        }
-
-        private async Task AppendToDailyLogFileAsync(Transaction transaction, string modalText)
-        {
-            try
-            {
-                string dailyFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ModalLogs", "Daily");
-                if (!Directory.Exists(dailyFolder))
-                    Directory.CreateDirectory(dailyFolder);
-
-                string dailyFileName = $"Onaylanmis_Islemler_{DateTime.Now:yyyyMMdd}.txt";
-                string dailyFilePath = Path.Combine(dailyFolder, dailyFileName);
-
-                using (StreamWriter writer = new StreamWriter(dailyFilePath, true, Encoding.UTF8))
-                {
-                    if (new FileInfo(dailyFilePath).Length == 0)
+                    var amountText = amountMatch.Groups[1].Value.Trim();
+                    if (decimal.TryParse(amountText, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal resultAmount))
                     {
-                        writer.WriteLine("=".PadRight(100, '='));
-                        writer.WriteLine($"ONAYLANMIŞ İŞLEM LOGLARI - {DateTime.Now:dd.MM.yyyy}");
-                        writer.WriteLine("=".PadRight(100, '='));
-                        writer.WriteLine();
+                        transaction.ResultAmount = resultAmount;
                     }
+                }
 
-                    writer.WriteLine($"■ İŞLEM: {transaction.TransactionNo}");
-                    writer.WriteLine($"  Müşteri: {transaction.CustomerName}");
-                    writer.WriteLine($"  Tutar: {transaction.ResultAmount:N2} ₺");
-                    writer.WriteLine($"  IBAN: {transaction.IBAN}");
-                    writer.WriteLine($"  Banka: {transaction.BankName}");
-                    writer.WriteLine($"  Tarih: {DateTime.Now:dd.MM.yyyy HH:mm:ss}");
-                    writer.WriteLine($"  Dosya: Modal_{transaction.TransactionNo}_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-                    writer.WriteLine();
+                // 6. Son Onay Tarihi (B sütunu) - GG.AA.YYYY formatında
+                var lastApprovalMatch = System.Text.RegularExpressions.Regex.Match(
+                    modalHtml,
+                    @"Son Onay Tarihi.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+
+                if (lastApprovalMatch.Success)
+                {
+                    transaction.LastApprovalDateFormatted = lastApprovalMatch.Groups[1].Value.Trim();
+                }
+
+                // 7. IBAN
+                var ibanMatch = System.Text.RegularExpressions.Regex.Match(modalHtml, @"TR\d{24}");
+                if (ibanMatch.Success)
+                {
+                    transaction.IBAN = ibanMatch.Value;
                 }
             }
             catch (Exception ex)
             {
-                LoggerHelper.LogError(ex, "Günlük log dosyasına yazma hatası");
+                LoggerHelper.LogError(ex, "Modal HTML parse hatası");
             }
         }
 
@@ -1077,42 +1261,18 @@ namespace Proje.Service
         {
             try
             {
-                var closeButton = await _page.QuerySelectorAsync(@"
-                    button[aria-label='Close'], 
-                    button[data-slot='close-button'],
-                    .close-button,
-                    [class*='close'],
-                    button:has(svg[aria-label='Close']),
-                    button:has-text('×'),
-                    button:has(svg.lucide-x)
-                ");
+                var closeButton = await _page.QuerySelectorAsync(
+                    "button[aria-label='Close'], " +
+                    "button[data-slot='close-button'], " +
+                    ".close-button, " +
+                    "[class*='close'], " +
+                    "button:has(svg[aria-label='Close']), " +
+                    "button:has-text('×'), " +
+                    "button:has(svg.lucide-x)");
 
                 if (closeButton != null && await closeButton.IsVisibleAsync())
                 {
                     await closeButton.ClickAsync();
-                    LoggerHelper.LogInformation("Modal X butonu ile kapatıldı.");
-                }
-                else
-                {
-                    await _page.Keyboard.PressAsync("Escape");
-                    LoggerHelper.LogInformation("Modal ESC ile kapatıldı.");
-                }
-            }
-            catch (Exception ex)
-            {
-                LoggerHelper.LogError(ex, "Modal kapatma hatası");
-                await TryCloseModalAsync();
-            }
-        }
-
-        private async Task TryCloseModalAsync()
-        {
-            try
-            {
-                var overlay = await _page.QuerySelectorAsync(".modal-backdrop, .overlay, [class*='backdrop']");
-                if (overlay != null)
-                {
-                    await overlay.ClickAsync(new ElementHandleClickOptions { Force = true });
                 }
                 else
                 {
@@ -1121,163 +1281,67 @@ namespace Proje.Service
 
                 await Task.Delay(500);
             }
-            catch
+            catch (Exception ex)
             {
-                // Hata olsa bile devam et
+                LoggerHelper.LogError(ex, "Modal kapatma hatası");
             }
         }
 
-        public async Task<Transaction> GetTransactionDetailsAsync(string transactionId)
-        {
-            throw new NotImplementedException();
-        }
-
-        public async Task<bool> IsLoggedInAsync()
-        {
-            try
-            {
-                var currentUrl = _page.Url;
-                return !currentUrl.Contains("login") &&
-                       !currentUrl.Contains("auth") &&
-                       await _page.ContentAsync().ContinueWith(t => !t.Result.Contains("Giriş Yap"));
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        // Bağlantı testi için yeni metod - MainForm'daki bağlantı testi butonu için
         public async Task<bool> TestConnectionAsync()
         {
-            bool connectionSuccess = false;
-            bool pageLoaded = false;
-
             try
             {
                 LoggerHelper.LogInformation("Bağlantı testi başlatılıyor...");
 
-                // 1. İnternet bağlantısını test et
-                LoggerHelper.LogInformation("1. İnternet bağlantısı kontrol ediliyor...");
+                // 1. İnternet bağlantısı testi
+                bool internetConnected = false;
 
-                using (var client = new System.Net.Http.HttpClient())
+                using (var ping = new Ping())
                 {
-                    client.Timeout = TimeSpan.FromSeconds(5);
                     try
                     {
-                        var response = await client.SendAsync(new System.Net.Http.HttpRequestMessage(
-                            System.Net.Http.HttpMethod.Head, "http://www.google.com"));
-                        connectionSuccess = response.IsSuccessStatusCode;
+                        var reply = await ping.SendPingAsync("8.8.8.8", 3000);
+                        internetConnected = reply.Status == IPStatus.Success;
                     }
-                    catch (Exception ex)
+                    catch { }
+                }
+
+                if (!internetConnected)
+                {
+                    using (var ping = new Ping())
                     {
-                        LoggerHelper.LogError(ex, "İnternet bağlantı testi başarısız!");
-                        return false;
+                        try
+                        {
+                            var reply = await ping.SendPingAsync("1.1.1.1", 3000);
+                            internetConnected = reply.Status == IPStatus.Success;
+                        }
+                        catch { }
                     }
                 }
 
-                if (!connectionSuccess)
+                if (!internetConnected)
                 {
-                    LoggerHelper.LogError(new Exception("İnternet bağlantısı başarısız"), "İnternet bağlantısı başarısız!");
+                    LoggerHelper.LogWarning("İnternet bağlantısı başarısız!");
                     return false;
                 }
 
                 LoggerHelper.LogInformation("✓ İnternet bağlantısı başarılı");
 
-                // 2. Playwright tarayıcı başlatma testi
-                LoggerHelper.LogInformation("2. Playwright tarayıcı kontrolü yapılıyor...");
+                // 2. Hedef siteye bağlantı testi
+                using var httpClient = new HttpClient();
+                httpClient.Timeout = TimeSpan.FromSeconds(10);
 
-                if (_playwright == null || _browser == null || !_browser.IsConnected)
-                {
-                    LoggerHelper.LogInformation("Tarayıcı başlatılmamış, test için geçici tarayıcı başlatılıyor...");
+                var authToken = Convert.ToBase64String(
+                    Encoding.ASCII.GetBytes($"{_credentials.BasicAuthUsername}:{_credentials.BasicAuthPassword}"));
 
-                    try
-                    {
-                        // ASYNC DISPOSABLE için await using kullan
-                        var tempPlaywright = await Playwright.CreateAsync();
-                        await using var tempBrowser = await tempPlaywright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
-                        {
-                            Headless = true,
-                            Timeout = 10000
-                        });
-
-                        var tempPage = await tempBrowser.NewPageAsync();
-
-                        // Basit bir sayfa yükleme testi
-                        var navigationResult = await tempPage.GotoAsync("https://www.google.com",
-                            new PageGotoOptions { Timeout = 10000, WaitUntil = WaitUntilState.NetworkIdle });
-
-                        pageLoaded = navigationResult?.Status == 200;
-
-                        if (pageLoaded)
-                        {
-                            LoggerHelper.LogInformation("✓ Tarayıcı başlatma testi başarılı");
-                        }
-
-                        // Manuel dispose
-                        await tempPage.CloseAsync();
-                        await tempBrowser.DisposeAsync();
-                        tempPlaywright.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        LoggerHelper.LogError(ex, "Tarayıcı başlatma testi başarısız!");
-                        return false;
-                    }
-                }
-                else
-                {
-                    // Tarayıcı zaten başlatılmış, mevcut sayfayı test et
-                    LoggerHelper.LogInformation("Mevcut tarayıcı durumu kontrol ediliyor...");
-
-                    if (_page != null && !_page.IsClosed)
-                    {
-                        try
-                        {
-                            // Mevcut sayfada basit bir JavaScript çalıştırarak kontrol et
-                            var title = await _page.TitleAsync();
-                            pageLoaded = !string.IsNullOrEmpty(title);
-                            LoggerHelper.LogInformation($"✓ Mevcut tarayıcı aktif. Sayfa başlığı: {title}");
-                        }
-                        catch (Exception ex)
-                        {
-                            LoggerHelper.LogWarning("Mevcut sayfa kapalı, yeni sayfa açılıyor...");
-
-                            try
-                            {
-                                _page = await _context.NewPageAsync();
-                                var navigation = await _page.GotoAsync("https://www.google.com",
-                                    new PageGotoOptions { Timeout = 5000 });
-                                pageLoaded = navigation?.Status == 200;
-                            }
-                            catch (Exception innerEx)
-                            {
-                                LoggerHelper.LogError(innerEx, "Yeni sayfa açma başarısız");
-                                pageLoaded = false;
-                            }
-                        }
-                    }
-                }
-
-                // 3. Hedef siteye bağlantı testi (PowerHavale)
-                LoggerHelper.LogInformation("3. Hedef siteye bağlantı test ediliyor...");
+                httpClient.DefaultRequestHeaders.Authorization =
+                    new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", authToken);
 
                 try
                 {
-                    using var httpClient = new System.Net.Http.HttpClient();
-                    httpClient.Timeout = TimeSpan.FromSeconds(10);
-
-                    // Basic Auth bilgilerini ekle
-                    var authToken = Convert.ToBase64String(
-                        System.Text.Encoding.ASCII.GetBytes($"{_credentials.BasicAuthUsername}:{_credentials.BasicAuthPassword}"));
-
-                    httpClient.DefaultRequestHeaders.Authorization =
-                        new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", authToken);
-
                     var testResponse = await httpClient.GetAsync(_credentials.LoginUrl);
                     var statusCode = (int)testResponse.StatusCode;
 
-                    // 200 (OK), 401 (Unauthorized - ama bağlantı var), 403 (Forbidden) bağlantının olduğunu gösterir
                     if (statusCode == 200 || statusCode == 401 || statusCode == 403)
                     {
                         LoggerHelper.LogInformation($"✓ Hedef siteye bağlantı başarılı. HTTP Durumu: {statusCode}");
@@ -1285,14 +1349,13 @@ namespace Proje.Service
                     }
                     else
                     {
-                        LoggerHelper.LogError(new Exception($"Hedef siteye bağlantı başarısız. HTTP Durumu: {statusCode}"),
-                            "Hedef siteye bağlantı başarısız");
+                        LoggerHelper.LogWarning($"Hedef siteye bağlantı var ama HTTP Durumu: {statusCode}");
                         return false;
                     }
                 }
-                catch (Exception ex)
+                catch (HttpRequestException ex)
                 {
-                    LoggerHelper.LogError(ex, "Hedef site bağlantı testi hatası");
+                    LoggerHelper.LogError(ex, "Hedef siteye bağlantı başarısız");
                     return false;
                 }
             }
@@ -1301,19 +1364,363 @@ namespace Proje.Service
                 LoggerHelper.LogError(ex, "Genel bağlantı testi hatası");
                 return false;
             }
-            finally
+        }
+
+        public async Task<bool> IsLoggedInAsync()
+        {
+            try
             {
-                LoggerHelper.LogInformation(connectionSuccess && pageLoaded
-                    ? "✓ Bağlantı testi tamamlandı: BAŞARILI"
-                    : "✗ Bağlantı testi tamamlandı: BAŞARISIZ");
+                var currentUrl = _page.Url;
+                var content = await _page.ContentAsync();
+
+                return !currentUrl.Contains("login") &&
+                       !currentUrl.Contains("auth") &&
+                       !content.Contains("Giriş Yap") &&
+                       !content.Contains("401") &&
+                       !content.Contains("403");
             }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public async Task<Transaction> GetTransactionDetailsAsync(string transactionId)
+        {
+            try
+            {
+                LoggerHelper.LogInformation($"İşlem detayları alınıyor: {transactionId}");
+
+                // İşlem Geçmişi sayfasına git
+                if (!await NavigateToTransactionHistoryAsync())
+                {
+                    LoggerHelper.LogWarning("İşlem Geçmişi sayfasına ulaşılamadı.");
+                    return null;
+                }
+
+                // Arama alanına işlem ID'sini yaz
+                var searchInput = await _page.QuerySelectorAsync("input[placeholder='Ara...']");
+                if (searchInput != null)
+                {
+                    await searchInput.FillAsync(transactionId);
+                    await Task.Delay(1000);
+
+                    // Ara butonuna tıkla
+                    await ClickSearchButtonAsync();
+                }
+
+                // Tablodaki satırları kontrol et
+                var rows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
+                foreach (var row in rows)
+                {
+                    var transactionNoElements = await row.QuerySelectorAllAsync("td:nth-child(1) button");
+                    if (transactionNoElements.Count > 0)
+                    {
+                        var currentTransactionId = await ExtractTextFromButtonAsync(transactionNoElements[0]);
+                        if (currentTransactionId == transactionId)
+                        {
+                            var transaction = await ExtractTransactionFromRowAsync(row);
+                            if (transaction != null && transaction.Status == "Onaylandı")
+                            {
+                                // Modal detayları al
+                                var detailButton = await row.QuerySelectorAsync("td:nth-child(7) button[data-slot='sheet-trigger']");
+                                if (detailButton != null)
+                                {
+                                    await detailButton.ClickAsync();
+                                    await Task.Delay(1500);
+                                    await ExtractModalDetailsAsync(transaction);
+                                    await CloseModalAsync();
+                                }
+                                return transaction;
+                            }
+                        }
+                    }
+                }
+
+                LoggerHelper.LogWarning($"İşlem bulunamadı: {transactionId}");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, $"İşlem detayları alma hatası: {transactionId}");
+                return null;
+            }
+        }
+
+        public async Task<bool> TestPaginationAsync()
+        {
+            try
+            {
+                LoggerHelper.LogInformation("=== PAGINATION TESTİ BAŞLATILIYOR ===");
+
+                // İşlem Geçmişi sayfasına git
+                if (!await NavigateToTransactionHistoryAsync())
+                    return false;
+
+                // Filtreleri uygula
+                await ApplyFiltersAsync("Onaylandı", "Yatırım");
+
+                // 1. Sayfadaki satırları say
+                var page1Rows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
+                LoggerHelper.LogInformation($"1. sayfada {page1Rows.Count} satır bulundu.");
+
+                if (page1Rows.Count == 0)
+                {
+                    LoggerHelper.LogWarning("1. sayfada hiç satır yok!");
+                    return false;
+                }
+
+                // İlk satırın içeriğini kaydet
+                var firstRowPage1 = await page1Rows[0].InnerHTMLAsync();
+
+                // 2. Sonraki sayfaya gitmeyi dene
+                bool canNavigate = await NavigateToNextPageAsync(1);
+
+                if (canNavigate)
+                {
+                    // 2. Sayfadaki satırları say
+                    var page2Rows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
+                    LoggerHelper.LogInformation($"2. sayfada {page2Rows.Count} satır bulundu.");
+
+                    if (page2Rows.Count > 0)
+                    {
+                        // İlk satırların içeriğini karşılaştır
+                        var firstRowPage2 = await page2Rows[0].InnerHTMLAsync();
+
+                        if (firstRowPage1 != firstRowPage2)
+                        {
+                            LoggerHelper.LogInformation("✅ PAGINATION ÇALIŞIYOR - Sayfalar farklı içeriğe sahip");
+                            return true;
+                        }
+                        else
+                        {
+                            LoggerHelper.LogWarning("⚠️ PAGINATION ÇALIŞMIYOR - Sayfalar aynı içeriğe sahip");
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        LoggerHelper.LogWarning("2. sayfada hiç satır yok!");
+                        return false;
+                    }
+                }
+                else
+                {
+                    LoggerHelper.LogWarning("⚠️ PAGINATION ÇALIŞMIYOR - Sonraki sayfaya geçilemedi");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Pagination testi hatası");
+                return false;
+            }
+        }
+
+        public async Task<bool> ResetToDefaultViewAsync()
+        {
+            try
+            {
+                LoggerHelper.LogInformation("Sayfa varsayılan duruma getiriliyor...");
+
+                // 1. Sayfayı yenile
+                await _page.ReloadAsync(new PageReloadOptions
+                {
+                    WaitUntil = WaitUntilState.NetworkIdle,
+                    Timeout = 15000
+                });
+                await Task.Delay(2000);
+
+                // 2. Tüm açık modal veya açılır pencereleri kapat
+                await CloseAllModalsAsync();
+
+                // 3. Filtreleri temizle
+                await ClearTransactionFiltersAsync();
+
+                LoggerHelper.LogInformation("✅ Sayfa varsayılan duruma getirildi.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Sayfayı varsayılan duruma getirme hatası");
+                return false;
+            }
+        }
+
+        public async Task<bool> ClearTransactionFiltersAsync()
+        {
+            try
+            {
+                LoggerHelper.LogInformation("İşlem filtreleri temizleniyor...");
+
+                // 1. Önce filtre bölümünün yüklenmesini bekle
+                await Task.Delay(1000);
+
+                // 2. Tüm combobox'ları bul ve "Tümü" yap
+                var comboboxes = await _page.QuerySelectorAllAsync(
+                    "button[role='combobox'][data-slot='select-trigger'], " +
+                    "button[role='combobox']");
+
+                LoggerHelper.LogInformation($"{comboboxes.Count} adet combobox bulundu.");
+
+                foreach (var combobox in comboboxes)
+                {
+                    try
+                    {
+                        // Combobox'ın görünür olup olmadığını kontrol et
+                        if (!await combobox.IsVisibleAsync())
+                            continue;
+
+                        await combobox.ClickAsync();
+                        await Task.Delay(500);
+
+                        // "Tümü" seçeneğini ara
+                        var tumuOption = await _page.QuerySelectorAsync(
+                            "[role='option']:has-text('Tümü'), " +
+                            "[role='option']:has-text('Tüm Durumlar'), " +
+                            "[role='option']:has-text('Hepsi'), " +
+                            "[data-radix-select-viewport] :text('Tümü'), " +
+                            "[data-radix-select-viewport] :text('Tüm Durumlar'), " +
+                            "[data-radix-select-viewport] :text('Hepsi')");
+
+                        if (tumuOption != null)
+                        {
+                            await tumuOption.ClickAsync();
+                            LoggerHelper.LogInformation("Combobox 'Tümü' olarak ayarlandı.");
+                        }
+                        else
+                        {
+                            // "Tümü" bulunamazsa, ilk seçeneği seç veya Escape tuşuna bas
+                            var firstOption = await _page.QuerySelectorAsync("[role='option']:first-child");
+                            if (firstOption != null)
+                            {
+                                await firstOption.ClickAsync();
+                            }
+                            else
+                            {
+                                await _page.Keyboard.PressAsync("Escape");
+                            }
+                        }
+
+                        await Task.Delay(300);
+                    }
+                    catch (Exception ex)
+                    {
+                        LoggerHelper.LogError(ex, "Combobox temizleme hatası");
+                        // Hata durumunda Escape tuşuna bas
+                        await _page.Keyboard.PressAsync("Escape");
+                    }
+                }
+
+                // 3. Tarih filtrelerini temizle (eğer varsa)
+                await ClearDateFiltersAsync();
+
+                // 4. Arama inputlarını temizle
+                var searchInputs = await _page.QuerySelectorAllAsync(
+                    "input[placeholder*='Ara'], " +
+                    "input[type='search'], " +
+                    "input[placeholder*='Search']");
+
+                foreach (var input in searchInputs)
+                {
+                    try
+                    {
+                        if (await input.IsVisibleAsync())
+                        {
+                            await input.FillAsync("");
+                            await Task.Delay(200);
+                        }
+                    }
+                    catch { }
+                }
+
+                // 5. Ara butonuna tıkla veya Enter tuşuna bas
+                await ClickSearchButtonAsync();
+
+                // 6. Filtrelerin temizlenmesini bekle
+                await Task.Delay(1500);
+
+                LoggerHelper.LogInformation("✅ İşlem filtreleri başarıyla temizlendi.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Filtre temizleme hatası");
+                return false;
+            }
+        }
+
+        private async Task CloseAllModalsAsync()
+        {
+            try
+            {
+                // Escape tuşuna basarak açık modal varsa kapat
+                await _page.Keyboard.PressAsync("Escape");
+                await Task.Delay(500);
+
+                // Close butonlarını kontrol et
+                var closeButtons = await _page.QuerySelectorAllAsync(
+                    "button[aria-label='Close'], " +
+                    "button[data-slot='close-button'], " +
+                    ".close-button, " +
+                    "button:has(svg.lucide-x)");
+
+                foreach (var closeButton in closeButtons)
+                {
+                    try
+                    {
+                        if (await closeButton.IsVisibleAsync())
+                        {
+                            await closeButton.ClickAsync();
+                            await Task.Delay(300);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
+
+        private async Task ClearDateFiltersAsync()
+        {
+            try
+            {
+                // Tarih inputlarını bul
+                var dateInputs = await _page.QuerySelectorAllAsync(
+                    "input[type='date'], " +
+                    "input[placeholder*='Tarih'], " +
+                    "input[placeholder*='Date']");
+
+                foreach (var input in dateInputs)
+                {
+                    try
+                    {
+                        if (await input.IsVisibleAsync())
+                        {
+                            await input.FillAsync("");
+                            await Task.Delay(200);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
         }
 
         public void Dispose()
         {
-            _page?.CloseAsync();
-            _browser?.CloseAsync();
-            _playwright?.Dispose();
+            try
+            {
+                StopContinuousProcessing();
+                _page?.CloseAsync();
+                _browser?.CloseAsync();
+                _playwright?.Dispose();
+                LoggerHelper.LogInformation("WebAutomationService başarıyla dispose edildi.");
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Dispose sırasında hata");
+            }
         }
     }
 }
