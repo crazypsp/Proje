@@ -1147,6 +1147,168 @@ namespace Proje.Service
             }
         }
 
+        // Bağlantı testi için yeni metod - MainForm'daki bağlantı testi butonu için
+        public async Task<bool> TestConnectionAsync()
+        {
+            bool connectionSuccess = false;
+            bool pageLoaded = false;
+
+            try
+            {
+                LoggerHelper.LogInformation("Bağlantı testi başlatılıyor...");
+
+                // 1. İnternet bağlantısını test et
+                LoggerHelper.LogInformation("1. İnternet bağlantısı kontrol ediliyor...");
+
+                using (var client = new System.Net.Http.HttpClient())
+                {
+                    client.Timeout = TimeSpan.FromSeconds(5);
+                    try
+                    {
+                        var response = await client.SendAsync(new System.Net.Http.HttpRequestMessage(
+                            System.Net.Http.HttpMethod.Head, "http://www.google.com"));
+                        connectionSuccess = response.IsSuccessStatusCode;
+                    }
+                    catch (Exception ex)
+                    {
+                        LoggerHelper.LogError(ex, "İnternet bağlantı testi başarısız!");
+                        return false;
+                    }
+                }
+
+                if (!connectionSuccess)
+                {
+                    LoggerHelper.LogError(new Exception("İnternet bağlantısı başarısız"), "İnternet bağlantısı başarısız!");
+                    return false;
+                }
+
+                LoggerHelper.LogInformation("✓ İnternet bağlantısı başarılı");
+
+                // 2. Playwright tarayıcı başlatma testi
+                LoggerHelper.LogInformation("2. Playwright tarayıcı kontrolü yapılıyor...");
+
+                if (_playwright == null || _browser == null || !_browser.IsConnected)
+                {
+                    LoggerHelper.LogInformation("Tarayıcı başlatılmamış, test için geçici tarayıcı başlatılıyor...");
+
+                    try
+                    {
+                        // ASYNC DISPOSABLE için await using kullan
+                        var tempPlaywright = await Playwright.CreateAsync();
+                        await using var tempBrowser = await tempPlaywright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+                        {
+                            Headless = true,
+                            Timeout = 10000
+                        });
+
+                        var tempPage = await tempBrowser.NewPageAsync();
+
+                        // Basit bir sayfa yükleme testi
+                        var navigationResult = await tempPage.GotoAsync("https://www.google.com",
+                            new PageGotoOptions { Timeout = 10000, WaitUntil = WaitUntilState.NetworkIdle });
+
+                        pageLoaded = navigationResult?.Status == 200;
+
+                        if (pageLoaded)
+                        {
+                            LoggerHelper.LogInformation("✓ Tarayıcı başlatma testi başarılı");
+                        }
+
+                        // Manuel dispose
+                        await tempPage.CloseAsync();
+                        await tempBrowser.DisposeAsync();
+                        tempPlaywright.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        LoggerHelper.LogError(ex, "Tarayıcı başlatma testi başarısız!");
+                        return false;
+                    }
+                }
+                else
+                {
+                    // Tarayıcı zaten başlatılmış, mevcut sayfayı test et
+                    LoggerHelper.LogInformation("Mevcut tarayıcı durumu kontrol ediliyor...");
+
+                    if (_page != null && !_page.IsClosed)
+                    {
+                        try
+                        {
+                            // Mevcut sayfada basit bir JavaScript çalıştırarak kontrol et
+                            var title = await _page.TitleAsync();
+                            pageLoaded = !string.IsNullOrEmpty(title);
+                            LoggerHelper.LogInformation($"✓ Mevcut tarayıcı aktif. Sayfa başlığı: {title}");
+                        }
+                        catch (Exception ex)
+                        {
+                            LoggerHelper.LogWarning("Mevcut sayfa kapalı, yeni sayfa açılıyor...");
+
+                            try
+                            {
+                                _page = await _context.NewPageAsync();
+                                var navigation = await _page.GotoAsync("https://www.google.com",
+                                    new PageGotoOptions { Timeout = 5000 });
+                                pageLoaded = navigation?.Status == 200;
+                            }
+                            catch (Exception innerEx)
+                            {
+                                LoggerHelper.LogError(innerEx, "Yeni sayfa açma başarısız");
+                                pageLoaded = false;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Hedef siteye bağlantı testi (PowerHavale)
+                LoggerHelper.LogInformation("3. Hedef siteye bağlantı test ediliyor...");
+
+                try
+                {
+                    using var httpClient = new System.Net.Http.HttpClient();
+                    httpClient.Timeout = TimeSpan.FromSeconds(10);
+
+                    // Basic Auth bilgilerini ekle
+                    var authToken = Convert.ToBase64String(
+                        System.Text.Encoding.ASCII.GetBytes($"{_credentials.BasicAuthUsername}:{_credentials.BasicAuthPassword}"));
+
+                    httpClient.DefaultRequestHeaders.Authorization =
+                        new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", authToken);
+
+                    var testResponse = await httpClient.GetAsync(_credentials.LoginUrl);
+                    var statusCode = (int)testResponse.StatusCode;
+
+                    // 200 (OK), 401 (Unauthorized - ama bağlantı var), 403 (Forbidden) bağlantının olduğunu gösterir
+                    if (statusCode == 200 || statusCode == 401 || statusCode == 403)
+                    {
+                        LoggerHelper.LogInformation($"✓ Hedef siteye bağlantı başarılı. HTTP Durumu: {statusCode}");
+                        return true;
+                    }
+                    else
+                    {
+                        LoggerHelper.LogError(new Exception($"Hedef siteye bağlantı başarısız. HTTP Durumu: {statusCode}"),
+                            "Hedef siteye bağlantı başarısız");
+                        return false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LoggerHelper.LogError(ex, "Hedef site bağlantı testi hatası");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Genel bağlantı testi hatası");
+                return false;
+            }
+            finally
+            {
+                LoggerHelper.LogInformation(connectionSuccess && pageLoaded
+                    ? "✓ Bağlantı testi tamamlandı: BAŞARILI"
+                    : "✗ Bağlantı testi tamamlandı: BAŞARISIZ");
+            }
+        }
+
         public void Dispose()
         {
             _page?.CloseAsync();
