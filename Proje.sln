@@ -1,4 +1,4 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.36908.2
@@ -17,7 +17,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Proje.Business", "Proje.Bus
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Proje.Service", "Proje.Service\Proje.Service.csproj", "{EB2FDDC2-9339-4F95-BBEE-C35AA3659E63}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Proje.Destop", "Proje.Destop\Proje.Destop.csproj", "{7F81C1F4-2142-4E73-A420-31A277E9CBE2}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Proje.Desktop", "Proje.Desktop\Proje.Desktop.csproj", "{7F81C1F4-2142-4E73-A420-31A277E9CBE2}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

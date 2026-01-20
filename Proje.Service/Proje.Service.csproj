@@ -18,5 +18,9 @@
     <ProjectReference Include="..\Proje.Enums\Proje.Enums.csproj" />
     <ProjectReference Include="..\Proje.Models\Proje.Models.csproj" />
   </ItemGroup>
-
+	<ItemGroup>
+		<None Update="credentials\google-service-account.json">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
 </Project>
