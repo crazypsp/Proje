@@ -24,9 +24,7 @@ namespace Proje.Core.Interfaces
         void Dispose();
 
         // Yeni method: Filtre uygulayarak işlemleri çek
-        Task<List<Transaction>> ExtractTransactionsWithFilterAsync(
-            string status = "Onaylandı",
-            string transactionType = "Yatırım",
-            bool autoPaginate = false);
+        Task<List<Transaction>> ExtractTransactionsWithFilterAsync(string status = "Onaylandı", string transactionType = "Yatırım", bool autoPaginate = false, bool onlyNew = false);
+        Task<bool> ResetProcessedTransactionIdsAsync();
     }
 }

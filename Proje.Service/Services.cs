@@ -661,9 +661,10 @@ namespace Proje.Service
         }
 
         public async Task<List<Transaction>> ExtractTransactionsWithFilterAsync(
-            string status = "Onaylandı",
-            string transactionType = "Yatırım",
-            bool autoPaginate = false)
+    string status = "Onaylandı",
+    string transactionType = "Yatırım",
+    bool autoPaginate = false,
+    bool onlyNew = false)
         {
             var allTransactions = new List<Transaction>();
             int currentPage = 1;
@@ -671,7 +672,7 @@ namespace Proje.Service
 
             try
             {
-                LoggerHelper.LogInformation($"Filtreli işlem çekme başlatılıyor: {status}, {transactionType}");
+                LoggerHelper.LogInformation($"Filtreli işlem çekme başlatılıyor: {status}, {transactionType}, Sadece Yeni: {onlyNew}");
 
                 // 1. Önce sayfanın tamamen yüklendiğinden emin ol
                 await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
@@ -713,11 +714,27 @@ namespace Proje.Service
                                 var transaction = await ExtractTransactionFromRowAsync(row);
                                 if (transaction != null && transaction.Status == status)
                                 {
-                                    // Bu işlemi daha önce işledik mi kontrol et
-                                    if (_processedTransactionIds.Contains(transaction.TransactionId ?? transaction.TransactionNo))
+                                    // Transaction ID oluştur
+                                    string transactionId = transaction.TransactionId ?? transaction.TransactionNo;
+
+                                    // onlyNew=true ise sadece daha önce işlenmemiş olanları al
+                                    if (onlyNew)
                                     {
-                                        LoggerHelper.LogInformation($"İşlem {transaction.TransactionNo} zaten işlenmiş, atlanıyor.");
-                                        continue;
+                                        if (_processedTransactionIds.Contains(transactionId) ||
+                                            _existingTransactionIds.Contains(transactionId))
+                                        {
+                                            LoggerHelper.LogInformation($"İşlem {transactionId} zaten işlenmiş, atlanıyor.");
+                                            continue;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // onlyNew=false ise sadece bu oturumda işlenmemiş olanları kontrol et
+                                        if (_processedTransactionIds.Contains(transactionId))
+                                        {
+                                            LoggerHelper.LogInformation($"İşlem {transactionId} bu oturumda işlenmiş, atlanıyor.");
+                                            continue;
+                                        }
                                     }
 
                                     // Modal detayları al (eğer buton varsa)
@@ -729,7 +746,7 @@ namespace Proje.Service
                                     if (detailButton != null && await detailButton.IsVisibleAsync())
                                     {
                                         await detailButton.ClickAsync();
-                                        await Task.Delay(2000); // Modal'ın yüklenmesi için daha fazla zaman
+                                        await Task.Delay(2000);
                                         await ExtractModalDetailsAsync(transaction);
                                         await CloseModalAsync();
                                     }
@@ -738,7 +755,7 @@ namespace Proje.Service
                                     await WriteTransactionToGoogleSheetAsync(transaction, transactionType);
                                     allTransactions.Add(transaction);
                                     newTransactions++;
-                                    LoggerHelper.LogInformation($"✅ İşlem eklendi: {transaction.TransactionNo}");
+                                    LoggerHelper.LogInformation($"✅ YENİ İşlem eklendi: {transactionId}");
                                 }
                             }
                             catch (Exception ex)
@@ -771,7 +788,7 @@ namespace Proje.Service
                     }
                 }
 
-                LoggerHelper.LogInformation($"✅ {allTransactions.Count} adet işlem başarıyla çekildi! {currentPage} sayfa işlendi.");
+                LoggerHelper.LogInformation($"✅ {allTransactions.Count} adet YENİ işlem başarıyla çekildi! {currentPage} sayfa işlendi.");
                 return allTransactions;
             }
             catch (Exception ex)
@@ -1706,7 +1723,21 @@ namespace Proje.Service
             }
             catch { }
         }
-
+        public async Task<bool> ResetProcessedTransactionIdsAsync()
+        {
+            try
+            {
+                int count = _processedTransactionIds.Count;
+                _processedTransactionIds.Clear();
+                LoggerHelper.LogInformation($"{count} adet işlenmiş işlem ID'si temizlendi.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "İşlem ID'leri temizleme hatası");
+                return false;
+            }
+        }
         public void Dispose()
         {
             try

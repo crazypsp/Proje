@@ -16,6 +16,7 @@ namespace Proje.Business.Managers
         private CancellationTokenSource _cts;
         private bool _isContinuousProcessing = false;
         private readonly object _lock = new object();
+        private int _cycleCount = 0;
 
         public TransactionManager(IWebAutomationService webService, IExcelService excelService)
         {
@@ -23,18 +24,30 @@ namespace Proje.Business.Managers
             _excelService = excelService;
         }
 
-        public async Task<bool> ExecuteFullAutomationAsync(string excelFilePath, int pageCount = 10)
+        public async Task<bool> ExecuteFullAutomationAsync(string excelFilePath, int pageCount = 10, bool resetTransactionMemory = true)
         {
             try
             {
-                LoggerHelper.LogInformation("Tam otomasyon başlatılıyor...");
+                _cycleCount++;
+                LoggerHelper.LogInformation($"=== DÖNGÜ #{_cycleCount} BAŞLATILIYOR ===");
 
-                // 1. Login ol
-                var isLoggedIn = await _webService.LoginAsync();
+                // Belleği temizle (opsiyonel)
+                if (resetTransactionMemory)
+                {
+                    await _webService.ResetProcessedTransactionIdsAsync();
+                }
+
+                // 1. Login ol (gerekirse)
+                var isLoggedIn = await _webService.IsLoggedInAsync();
                 if (!isLoggedIn)
                 {
-                    LoggerHelper.LogError(null, "Login başarısız!");
-                    return false;
+                    LoggerHelper.LogInformation("Oturum açılmamış, login deneniyor...");
+                    isLoggedIn = await _webService.LoginAsync();
+                    if (!isLoggedIn)
+                    {
+                        LoggerHelper.LogError(null, "Login başarısız!");
+                        return false;
+                    }
                 }
 
                 // 2. İşlem Geçmişi sayfasına git
@@ -49,12 +62,13 @@ namespace Proje.Business.Managers
                 await Task.Delay(1500);
                 await _webService.ResetToDefaultViewAsync();
 
-                // 4. Yatırım işlemlerini çek
-                LoggerHelper.LogInformation("Yatırım işlemleri çekiliyor...");
+                // 4. Yatırım işlemlerini çek (SADECE YENİ OLANLARI)
+                LoggerHelper.LogInformation("Yeni Yatırım işlemleri kontrol ediliyor...");
                 var depositTransactions = await _webService.ExtractTransactionsWithFilterAsync(
                     status: "Onaylandı",
                     transactionType: "Yatırım",
-                    autoPaginate: true);
+                    autoPaginate: true,
+                    onlyNew: true);
 
                 if (depositTransactions == null)
                 {
@@ -71,19 +85,19 @@ namespace Proje.Business.Managers
                 if (!refreshed)
                 {
                     LoggerHelper.LogWarning("İşlem Geçmişi sayfasına tekrar yönlendirilemedi!");
-                    // Yine de devam etmeyi deneyelim
                 }
 
                 // Filtreleri temizle
                 await _webService.ClearTransactionFiltersAsync();
                 await Task.Delay(800);
 
-                // 6. Çekim işlemlerini çek
-                LoggerHelper.LogInformation("Çekim işlemleri çekiliyor...");
+                // 6. Çekim işlemlerini çek (SADECE YENİ OLANLARI)
+                LoggerHelper.LogInformation("Yeni Çekim işlemleri kontrol ediliyor...");
                 var withdrawalTransactions = await _webService.ExtractTransactionsWithFilterAsync(
                     status: "Onaylandı",
                     transactionType: "Çekim",
-                    autoPaginate: true);
+                    autoPaginate: true,
+                    onlyNew: true);
 
                 if (withdrawalTransactions == null)
                 {
@@ -96,23 +110,23 @@ namespace Proje.Business.Managers
                 if (depositTransactions.Count > 0)
                 {
                     allTransactions.AddRange(depositTransactions);
-                    LoggerHelper.LogInformation($"{depositTransactions.Count} adet Yatırım işlemi çekildi.");
+                    LoggerHelper.LogInformation($"{depositTransactions.Count} adet YENİ Yatırım işlemi bulundu.");
                 }
 
                 if (withdrawalTransactions.Count > 0)
                 {
                     allTransactions.AddRange(withdrawalTransactions);
-                    LoggerHelper.LogInformation($"{withdrawalTransactions.Count} adet Çekim işlemi çekildi.");
+                    LoggerHelper.LogInformation($"{withdrawalTransactions.Count} adet YENİ Çekim işlemi bulundu.");
                 }
 
                 if (allTransactions.Count == 0)
                 {
-                    LoggerHelper.LogWarning("Hiç işlem verisi çekilemedi!");
-                    return false;
+                    LoggerHelper.LogInformation("Yeni işlem bulunamadı.");
+                    return true; // Hata değil, sadece yeni işlem yok
                 }
 
                 // 8. Excel'e yaz
-                LoggerHelper.LogInformation($"Toplam {allTransactions.Count} işlem Excel'e yazılıyor...");
+                LoggerHelper.LogInformation($"Toplam {allTransactions.Count} YENİ işlem Excel'e yazılıyor...");
                 var excelSuccess = _excelService.WriteTransactionsToExcel(allTransactions, excelFilePath);
                 if (!excelSuccess)
                 {
@@ -120,7 +134,8 @@ namespace Proje.Business.Managers
                     return false;
                 }
 
-                LoggerHelper.LogInformation($"Tam otomasyon başarıyla tamamlandı! {allTransactions.Count} işlem kaydedildi.");
+                LoggerHelper.LogInformation($"=== DÖNGÜ #{_cycleCount} BAŞARIYLA TAMAMLANDI ===");
+                LoggerHelper.LogInformation($"{allTransactions.Count} yeni işlem kaydedildi.");
                 return true;
             }
             catch (Exception ex)
@@ -130,8 +145,8 @@ namespace Proje.Business.Managers
             }
         }
 
-        // Sürekli işlem döngüsünü başlat
-        public async void StartContinuousProcessing(string excelFilePath = null, int intervalMinutes = 5)
+        // Sürekli işlem döngüsünü başlat (GÜNCELLENMİŞ)
+        public async void StartContinuousProcessing(string excelFilePath = null, int intervalMinutes = 5, bool combineAllInOneFile = false)
         {
             lock (_lock)
             {
@@ -141,6 +156,7 @@ namespace Proje.Business.Managers
                     return;
                 }
                 _isContinuousProcessing = true;
+                _cycleCount = 0;
             }
 
             _cts = new CancellationTokenSource();
@@ -148,48 +164,58 @@ namespace Proje.Business.Managers
             // Default excel dosya yolu
             string filePath = excelFilePath ?? $"TransactionHistory_{DateTime.Now:yyyyMMdd_HHmmss}.xlsx";
 
-            LoggerHelper.LogInformation($"Sürekli işlem döngüsü başlatıldı. Her {intervalMinutes} dakikada bir çalışacak.");
+            LoggerHelper.LogInformation($"=== SÜREKLİ İŞLEM DÖNGÜSÜ BAŞLATILIYOR ===");
+            LoggerHelper.LogInformation($"Her {intervalMinutes} dakikada bir yeni işlemler kontrol edilecek.");
 
             try
             {
-                int cycleCount = 0;
+                List<Transaction> allCycleTransactions = new List<Transaction>();
 
                 while (_isContinuousProcessing && !_cts.Token.IsCancellationRequested)
                 {
-                    cycleCount++;
-                    LoggerHelper.LogInformation($"=== DÖNGÜ #{cycleCount} BAŞLATILIYOR ===");
-
                     try
                     {
-                        // Excel dosya adını güncelle (her döngüde farklı dosya)
-                        if (excelFilePath == null)
+                        _cycleCount++;
+                        LoggerHelper.LogInformation($"=== DÖNGÜ #{_cycleCount} BAŞLATILIYOR ===");
+
+                        // Excel dosya adını güncelle (her döngüde farklı dosya veya aynı dosya)
+                        if (excelFilePath == null && !combineAllInOneFile)
                         {
-                            filePath = $"TransactionHistory_{DateTime.Now:yyyyMMdd_HHmmss}_Cycle{cycleCount}.xlsx";
+                            filePath = $"TransactionHistory_{DateTime.Now:yyyyMMdd_HHmmss}_Cycle{_cycleCount}.xlsx";
                         }
 
-                        bool success = await ExecuteFullAutomationAsync(filePath);
+                        bool success = await ExecuteFullAutomationAsync(filePath, resetTransactionMemory: false);
 
                         if (success)
                         {
-                            LoggerHelper.LogInformation($"Döngü #{cycleCount} başarıyla tamamlandı. {intervalMinutes} dakika sonra tekrar...");
+                            LoggerHelper.LogInformation($"Döngü #{_cycleCount} başarıyla tamamlandı.");
                         }
                         else
                         {
-                            LoggerHelper.LogWarning($"Döngü #{cycleCount} başarısız oldu. {intervalMinutes} dakika sonra tekrar deneniyor...");
+                            LoggerHelper.LogWarning($"Döngü #{_cycleCount} başarısız oldu.");
                         }
+
+                        LoggerHelper.LogInformation($"{intervalMinutes} dakika sonra tekrar kontrol edilecek...");
                     }
                     catch (Exception ex)
                     {
-                        LoggerHelper.LogError(ex, $"Döngü #{cycleCount} sırasında beklenmeyen hata");
+                        LoggerHelper.LogError(ex, $"Döngü #{_cycleCount} sırasında beklenmeyen hata");
                     }
 
                     // Bekleme süresi (kullanıcı projeyi kapatana kadar)
-                    for (int i = 0; i < intervalMinutes * 60 && _isContinuousProcessing; i++)
+                    try
                     {
-                        if (_cts.Token.IsCancellationRequested) break;
+                        for (int i = 0; i < intervalMinutes * 60 && _isContinuousProcessing; i++)
+                        {
+                            if (_cts.Token.IsCancellationRequested) break;
 
-                        // Her saniye kontrol et
-                        await Task.Delay(1000, _cts.Token);
+                            // Her saniye kontrol et
+                            await Task.Delay(1000, _cts.Token);
+                        }
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        // Normal durdurma, devam et
                     }
                 }
             }
@@ -207,7 +233,7 @@ namespace Proje.Business.Managers
                 {
                     _isContinuousProcessing = false;
                 }
-                LoggerHelper.LogInformation("Sürekli işlem döngüsü tamamen durduruldu.");
+                LoggerHelper.LogInformation("=== SÜREKLİ İŞLEM DÖNGÜSÜ DURDURULDU ===");
             }
         }
 
@@ -239,6 +265,14 @@ namespace Proje.Business.Managers
             }
         }
 
+        // Belleği temizle
+        public async Task ResetTransactionMemoryAsync()
+        {
+            await _webService.ResetProcessedTransactionIdsAsync();
+            _cycleCount = 0;
+            LoggerHelper.LogInformation("İşlem bellek temizlendi.");
+        }
+
         public async Task<List<Transaction>> GetTransactionsAsync(int pageCount = 5)
         {
             return await _webService.ExtractTransactionsAsync(pageCount);
@@ -247,6 +281,11 @@ namespace Proje.Business.Managers
         public bool ExportToExcel(List<Transaction> transactions, string filePath)
         {
             return _excelService.WriteTransactionsToExcel(transactions, filePath);
+        }
+
+        public int GetCurrentCycleCount()
+        {
+            return _cycleCount;
         }
     }
 }
