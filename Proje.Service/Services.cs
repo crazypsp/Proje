@@ -1,4 +1,7 @@
-﻿using System;
+﻿using Proje.Core.Helpers;
+using Proje.Core.Interfaces;
+using Proje.Entities.Entities;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -13,10 +16,8 @@ using Google.Apis.Services;
 using Google.Apis.Sheets.v4;
 using Google.Apis.Sheets.v4.Data;
 using Microsoft.Playwright;
-using Proje.Core.Helpers;
-using Proje.Core.Interfaces;
-using Proje.Entities.Entities;
 using Proje.Models;
+using System.Text.RegularExpressions;
 
 namespace Proje.Service
 {
@@ -36,7 +37,11 @@ namespace Proje.Service
         private int _processedTransactionCount = 0;
         private HashSet<string> _processedTransactionIds = new HashSet<string>();
         private HashSet<string> _existingTransactionIds = new HashSet<string>();
-
+        private DateTime? _lastDepositDate = null;
+        private DateTime? _lastWithdrawalDate = null;
+        private DateTime? _initialSelectedDate = null;
+        private string _initialSortOrder = "Eskiden Yeniye";
+        private bool _isLoggedIn = false;
         public WebAutomationService(LoginCredentials credentials, BrowserConfig browserConfig)
         {
             _credentials = credentials;
@@ -133,7 +138,7 @@ namespace Proje.Service
                     ApplicationName = "Proje",
                 });
 
-                LoggerHelper.LogInformation("Google Sheets servisi başlatıldı.");
+                LoggerHelper.LogInformation("Google Sheets servisi başarıyla başlatıldı.");
             }
             catch (Exception ex)
             {
@@ -151,8 +156,8 @@ namespace Proje.Service
                     await InitializeGoogleSheetsAsync();
                 }
 
-                // H sütunundaki tüm ID'leri oku (16. satırdan itibaren)
-                var range = $"{SheetName}!H16:H";
+                // I sütunundaki tüm ID'leri oku (16. satırdan itibaren)
+                var range = $"{SheetName}!I16:I";
                 var request = _sheetsService.Spreadsheets.Values.Get(SpreadsheetId, range);
                 var response = await request.ExecuteAsync();
 
@@ -228,47 +233,64 @@ namespace Proje.Service
                 }
 
                 // 5. Tarihi GG.AA.YYYY formatına çevir
-                string transactionDate = "01.01.2001"; // Varsayılan tarih
+                string transactionDateFormatted = "01.01.2001";
+                string transactionDateTimeFull = "01.01.2001 00:00:00";
 
                 // HTML'den Son Onay Tarihini al
                 if (!string.IsNullOrEmpty(transaction.LastApprovalDateFormatted))
                 {
-                    // "20.01.2026 22:00:42" formatından sadece tarihi al
                     var dateParts = transaction.LastApprovalDateFormatted.Split(' ');
                     if (dateParts.Length > 0)
                     {
-                        transactionDate = dateParts[0];
+                        transactionDateFormatted = dateParts[0]; // GG.AA.YYYY (B sütunu)
+                        transactionDateTimeFull = transaction.LastApprovalDateFormatted; // GG.AA.YYYY HH:mm:ss (C sütunu)
                     }
                 }
 
-                // 6. Tutarı işlem türüne göre ayarla
+                // 6. Tutarı işlem türüne göre ayarla ve ₺ simgesi ekle
                 decimal amount = transaction.ResultAmount;
+                string amountFormatted;
+
                 if (transactionType == "Çekim")
                 {
-                    amount = -amount;
+                    amountFormatted = $"-₺{amount:N2}";
+                }
+                else
+                {
+                    amountFormatted = $"₺{amount:N2}";
                 }
 
                 // 7. Boş satır bul
                 int emptyRow = await FindFirstEmptyRowFromRow16Async();
                 _currentRow = emptyRow;
 
-                LoggerHelper.LogInformation($"Onaylanmış işlem yazılıyor: {transaction.TransactionNo}, Satır: {_currentRow}, Tür: {transactionType}");
+                LoggerHelper.LogInformation($"Onaylanmış işlem yazılıyor: {transaction.TransactionNo}, Satır: {_currentRow}, Tür: {transactionType}, Tutar: {amountFormatted}");
 
-                // 8. Google Sheets'e yaz
-                var range = $"{SheetName}!B{_currentRow}:H{_currentRow}";
+                // 8. Google Sheets'e yaz - YENİ SÜTUN DÜZENİ
+                // B: Son Onay Tarihi (GG.AA.YYYY)
+                // C: Son Onay Tarihi (tam format: GG.AA.YYYY HH:mm:ss)
+                // D: İsim Soyisim
+                // E: Banka
+                // F: İban Sahibi
+                // G: Tutar (₺ simgesi ile)
+                // H: Boş
+                // I: İşlem ID
+
+                var range = $"{SheetName}!B{_currentRow}:I{_currentRow}";
                 var valueRange = new ValueRange
                 {
                     Values = new List<IList<object>>
                     {
                         new List<object>
                         {
-                            transactionDate, // B sütunu: İşlem Tarihi (GG.AA.YYYY)
-                            transaction.FullName ?? "", // C sütunu: İsim Soyisim
-                            transaction.BankName ?? "", // D sütunu: Banka
-                            transaction.AccountHolder ?? "", // E sütunu: IBAN Sahibi
-                            amount.ToString("N2", CultureInfo.InvariantCulture), // F sütunu: İşlem Tutarı
-                            "", // G sütunu: Boş bırakıldı
-                            transactionId // H sütunu: İşlem ID (Key)
+                            transactionDateFormatted, // B sütunu: Son Onay Tarihi (GG.AA.YYYY)
+                            transactionDateTimeFull, // C sütunu: Son Onay Tarihi (tam format)
+                            transaction.FullName ?? "", // D sütunu: İsim Soyisim
+                            transaction.BankName ?? "", // E sütunu: Banka
+                            transaction.AccountHolder ?? "", // F sütunu: IBAN Sahibi
+                            amountFormatted, // G sütunu: İşlem Tutarı (₺ ile formatlı)
+                            "", // H sütunu: Boş bırakıldı
+                            transactionId // I sütunu: İşlem ID (Key)
                         }
                     }
                 };
@@ -284,11 +306,11 @@ namespace Proje.Service
                 _currentRow++;
                 _processedTransactionCount++;
 
-                LoggerHelper.LogInformation($"✅ İşlem {transactionId} başarıyla yazıldı. Satır: {_currentRow - 1}, Tutar: {amount:N2}");
+                LoggerHelper.LogInformation($"✅ İşlem {transactionId} başarıyla yazıldı. Satır: {_currentRow - 1}, Tutar: {amountFormatted}");
             }
             catch (Google.GoogleApiException ex) when (ex.Message.Contains("protected cell"))
             {
-                LoggerHelper.LogError(ex, $"KORUMALI HÜCRE HATASI! B{_currentRow}:H{_currentRow} aralığı korumalı.");
+                LoggerHelper.LogError(ex, $"KORUMALI HÜCRE HATASI! B{_currentRow}:I{_currentRow} aralığı korumalı.");
                 throw;
             }
             catch (Exception ex)
@@ -458,27 +480,245 @@ namespace Proje.Service
             }
         }
 
-        private async Task ApplyFiltersAsync(string status = "Onaylandı", string transactionType = "Yatırım")
+        // TAMAMEN YENİ - Resimdeki takvim yapısına göre GÜN SEÇİMİ
+        public async Task ApplyDateFilterAsync(DateTime selectedDate)
         {
             try
             {
-                LoggerHelper.LogInformation($"Filtreler uygulanıyor: Durum={status}, İşlem Türü={transactionType}");
+                LoggerHelper.LogInformation($"Tarih filtresi uygulanıyor: {selectedDate:dd.MM.yyyy HH:mm}");
 
-                // Filtre butonlarının yüklenmesini bekle
+                // 1. Tarih butonunu bul ve tıkla
+                var datePickerButton = await _page.WaitForSelectorAsync(
+                    "button[data-slot='popover-trigger']:has(svg.lucide-calendar), " +
+                    "button:has-text('Oluşturma Tarihine Göre'), " +
+                    "button:has-text('Tarih'), " +
+                    "#date",
+                    new PageWaitForSelectorOptions { Timeout = 5000 });
+
+                if (datePickerButton == null)
+                {
+                    LoggerHelper.LogWarning("Tarih picker butonu bulunamadı!");
+                    return;
+                }
+
+                LoggerHelper.LogInformation("Tarih picker butonu bulundu, tıklanıyor...");
+                await datePickerButton.ClickAsync();
                 await Task.Delay(2000);
 
-                // 1. DURUM FİLTRESİNİ BUL VE UYGULA
+                // 2. Takvim popup'ını bekle
+                var datePickerPopup = await _page.WaitForSelectorAsync(
+                    "[role='dialog'], " +
+                    "[data-slot='popover-content'], " +
+                    ".rdp-root",
+                    new PageWaitForSelectorOptions { Timeout = 3000 });
+
+                if (datePickerPopup == null)
+                {
+                    LoggerHelper.LogWarning("Tarih picker popup'ı açılamadı!");
+                    await _page.Keyboard.PressAsync("Escape");
+                    return;
+                }
+
+                LoggerHelper.LogInformation("Tarih picker açıldı.");
+
+                // 3. TAKVİM TABLOSUNU BUL
+                var calendarTable = await datePickerPopup.QuerySelectorAsync("table[role='grid']");
+
+                if (calendarTable == null)
+                {
+                    calendarTable = await datePickerPopup.QuerySelectorAsync("table.rdp-table");
+                }
+
+                if (calendarTable == null)
+                {
+                    calendarTable = await datePickerPopup.QuerySelectorAsync("table");
+                }
+
+                if (calendarTable == null)
+                {
+                    LoggerHelper.LogWarning("Takvim tablosu bulunamadı!");
+                    await _page.Keyboard.PressAsync("Escape");
+                    return;
+                }
+
+                LoggerHelper.LogInformation("Takvim tablosu bulundu.");
+
+                // 4. GÜNÜ SEÇ - ÇOK ÖNEMLİ: Resimdeki gibi tıklanabilir gün butonlarını bul
+                int dayToSelect = selectedDate.Day;
+                bool daySelected = false;
+
+                // Önce tüm tıklanabilir gün butonlarını al
+                var dayButtons = await calendarTable.QuerySelectorAllAsync(
+                    "button[role='gridcell']:not([disabled]), " +
+                    "td button:not([disabled]), " +
+                    "button.rdp-day:not([disabled])");
+
+                LoggerHelper.LogInformation($"{dayButtons.Count} adet tıklanabilir gün butonu bulundu.");
+
+                foreach (var dayButton in dayButtons)
+                {
+                    try
+                    {
+                        var buttonText = await dayButton.InnerTextAsync();
+
+                        // Sadece sayı olan butonları kontrol et (günler)
+                        if (int.TryParse(buttonText.Trim(), out int day) && day == dayToSelect)
+                        {
+                            // Butonun görünür ve tıklanabilir olduğundan emin ol
+                            if (await dayButton.IsVisibleAsync())
+                            {
+                                await dayButton.ClickAsync();
+                                LoggerHelper.LogInformation($"✅ Gün seçildi: {dayToSelect}");
+                                daySelected = true;
+                                break;
+                            }
+                        }
+                    }
+                    catch { continue; }
+                }
+
+                if (!daySelected)
+                {
+                    // Alternatif: Tüm butonları dene
+                    var allButtons = await calendarTable.QuerySelectorAllAsync("button");
+                    foreach (var button in allButtons)
+                    {
+                        try
+                        {
+                            var buttonText = await button.InnerTextAsync();
+                            if (int.TryParse(buttonText.Trim(), out int day) && day == dayToSelect)
+                            {
+                                if (await button.IsVisibleAsync())
+                                {
+                                    await button.ClickAsync();
+                                    LoggerHelper.LogInformation($"✅ Gün seçildi (alternatif): {dayToSelect}");
+                                    daySelected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        catch { continue; }
+                    }
+                }
+
+                if (!daySelected)
+                {
+                    LoggerHelper.LogWarning($"Gün seçilemedi: {dayToSelect}. Escape tuşuna basılıyor...");
+                    await _page.Keyboard.PressAsync("Escape");
+                    return;
+                }
+
+                await Task.Delay(1000);
+
+                // 5. SAAT INPUTLARINI BUL VE SEÇİLEN SAATİ DOLDUR - Main Form'dan gelen saat
+                var timeInputs = await datePickerPopup.QuerySelectorAllAsync("input[type='time']");
+
+                if (timeInputs.Count >= 2)
+                {
+                    // Başlangıç saati: Seçilen tarihin saat kısmı (DateTimePicker'dan)
+                    var startTimeInput = timeInputs[0];
+                    string startTime = selectedDate.ToString("HH:mm");
+                    await startTimeInput.FillAsync(startTime);
+                    LoggerHelper.LogInformation($"Başlangıç saati ayarlandı: {startTime}");
+
+                    // Bitiş saati: 23:59
+                    var endTimeInput = timeInputs[1];
+                    await endTimeInput.FillAsync("23:59");
+                    LoggerHelper.LogInformation("Bitiş saati ayarlandı: 23:59");
+                }
+                else if (timeInputs.Count == 1)
+                {
+                    // Sadece bir time input varsa
+                    var timeInput = timeInputs[0];
+                    string startTime = selectedDate.ToString("HH:mm");
+                    await timeInput.FillAsync(startTime);
+                    LoggerHelper.LogInformation($"Saati ayarlandı: {startTime}");
+                }
+                else
+                {
+                    LoggerHelper.LogInformation("Time input bulunamadı, sadece tarih seçildi.");
+                }
+
+                // 6. TAMAM/UYGULA butonuna tıkla veya Enter'a bas
+                await Task.Delay(1000);
+
+                // Önce "Uygula" butonunu ara
+                var applyButton = await datePickerPopup.QuerySelectorAsync(
+                    "button:has-text('Uygula'), " +
+                    "button:has-text('Tamam'), " +
+                    "button:has-text('Apply'), " +
+                    "button:has-text('OK')");
+
+                if (applyButton != null)
+                {
+                    await applyButton.ClickAsync();
+                    LoggerHelper.LogInformation("Tarih filtresi uygulandı (Uygula butonu ile).");
+                }
+                else
+                {
+                    // Uygula butonu yoksa Enter tuşuna bas
+                    await _page.Keyboard.PressAsync("Enter");
+                    LoggerHelper.LogInformation("Tarih filtresi uygulandı (Enter ile).");
+                }
+
+                // 7. Filtrenin uygulanmasını bekle
+                await Task.Delay(1500);
+
+                LoggerHelper.LogInformation($"✅ Tarih filtresi başarıyla uygulandı: {selectedDate:dd.MM.yyyy HH:mm}");
+
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Tarih filtresi uygulama hatası");
+                try { await _page.Keyboard.PressAsync("Escape"); } catch { }
+            }
+        }
+
+        // TÜM FİLTRELERİ UYGULA VE ARA BUTONUNA TIKLA
+        private async Task ApplyFiltersAsync(
+            string status = "Onaylandı",
+            string transactionType = "Yatırım",
+            DateTime? selectedDate = null,
+            string sortOrder = "Eskiden Yeniye")
+        {
+            try
+            {
+                LoggerHelper.LogInformation($"Filtreler uygulanıyor: Durum={status}, İşlem Türü={transactionType}, Tarih={selectedDate}, Sıralama={sortOrder}");
+
+                // 1. Önce tüm filtreleri temizle
+                await ClearTransactionFiltersAsync();
+                await Task.Delay(2000);
+
+                // 2. Tarih filtresi uygula (eğer seçilmişse)
+                if (selectedDate.HasValue)
+                {
+                    await ApplyDateFilterAsync(selectedDate.Value);
+                    await Task.Delay(2000);
+                }
+
+                // 3. DURUM FİLTRESİNİ UYGULA
                 await ApplyStatusFilterAsync(status);
-                await Task.Delay(1000);
+                await Task.Delay(1500);
 
-                // 2. İŞLEM TÜRÜ FİLTRESİNİ BUL VE UYGULA
+                // 4. İŞLEM TÜRÜ FİLTRESİNİ UYGULA
                 await ApplyTransactionTypeFilterAsync(transactionType);
-                await Task.Delay(1000);
+                await Task.Delay(1500);
 
-                // 3. ARA BUTONUNU BUL VE TIKLA
+                // 5. SIRALAMA FİLTRESİNİ UYGULA
+                if (!string.IsNullOrEmpty(sortOrder))
+                {
+                    await ApplySortFilterAsync(sortOrder);
+                    await Task.Delay(1500);
+                }
+
+                // 6. ARA BUTONUNU BUL VE TIKLA - EN ÖNEMLİ ADIM
                 await ClickSearchButtonAsync();
 
-                LoggerHelper.LogInformation($"✅ Filtreler başarıyla uygulandı: {status}, {transactionType}");
+                // 7. Tablonun yüklenmesini bekle
+                await Task.Delay(3000);
+                await WaitForTableToLoadAsync();
+
+                LoggerHelper.LogInformation($"✅ Tüm filtreler başarıyla uygulandı ve ara butonuna tıklandı.");
             }
             catch (Exception ex)
             {
@@ -487,79 +727,89 @@ namespace Proje.Service
             }
         }
 
-        private async Task ApplyStatusFilterAsync(string status)
+        // SIRALAMA FİLTRESİ
+        public async Task ApplySortFilterAsync(string sortOrder)
         {
             try
             {
-                // Tüm combobox butonlarını bul
-                var comboboxes = await _page.QuerySelectorAllAsync(
-                    "button[role='combobox'][data-slot='select-trigger'], " +
-                    "button[role='combobox']");
+                LoggerHelper.LogInformation($"Sıralama filtresi uygulanıyor: {sortOrder}");
 
-                foreach (var combobox in comboboxes)
+                var sortCombobox = await _page.QuerySelectorAsync(
+                    "button[role='combobox']:has(span[data-slot='select-value']:has-text('Yeniden Eskiye')), " +
+                    "button[role='combobox']:has(span[data-slot='select-value']:has-text('Eskiden Yeniye'))");
+
+                if (sortCombobox == null)
                 {
-                    try
+                    var allComboboxes = await _page.QuerySelectorAllAsync("button[role='combobox'][data-slot='select-trigger']");
+                    foreach (var combo in allComboboxes)
                     {
-                        // Combobox içindeki metni kontrol et
-                        var span = await combobox.QuerySelectorAsync("span[data-slot='select-value']");
-                        if (span != null)
+                        try
                         {
-                            var currentText = await span.InnerTextAsync();
-
-                            // Eğer bu combobox'ın metni "Tümü", "Onaylandı", "Beklemede", "Reddedildi" vs ise bu durum combobox'ıdır
-                            if (currentText == "Tümü" ||
-                                currentText == "Onaylandı" ||
-                                currentText == "Beklemede" ||
-                                currentText == "Reddedildi")
+                            var span = await combo.QuerySelectorAsync("span[data-slot='select-value']");
+                            if (span != null)
                             {
-                                LoggerHelper.LogInformation($"Durum combobox'ı bulundu: {currentText} -> {status} olarak değiştiriliyor");
-
-                                await combobox.ClickAsync();
-                                await Task.Delay(800);
-
-                                // Option listesini bekle
-                                await _page.WaitForSelectorAsync("[role='option'], [data-radix-select-viewport]",
-                                    new PageWaitForSelectorOptions { Timeout = 3000 });
-                                await Task.Delay(500);
-
-                                // İstenen option'ı bul ve tıkla
-                                var option = await _page.QuerySelectorAsync(
-                                    $"[role='option']:has-text('{status}'), " +
-                                    $"[data-radix-select-viewport] :text('{status}')");
-
-                                if (option != null)
+                                var text = await span.InnerTextAsync();
+                                if (text == "Yeniden Eskiye" || text == "Eskiden Yeniye")
                                 {
-                                    await option.ClickAsync();
-                                    LoggerHelper.LogInformation($"Durum '{status}' olarak ayarlandı.");
+                                    sortCombobox = combo;
+                                    break;
                                 }
-                                else
-                                {
-                                    LoggerHelper.LogWarning($"'{status}' seçeneği bulunamadı!");
-                                    await _page.Keyboard.PressAsync("Escape");
-                                }
-
-                                await Task.Delay(500);
-                                return; // İlk bulduğumuz durum combobox'ı ile işlem yap
                             }
                         }
+                        catch { continue; }
                     }
-                    catch { continue; }
                 }
 
-                LoggerHelper.LogWarning("Durum filtresi combobox'ı bulunamadı!");
+                if (sortCombobox != null)
+                {
+                    var currentValueSpan = await sortCombobox.QuerySelectorAsync("span[data-slot='select-value']");
+                    if (currentValueSpan != null)
+                    {
+                        var currentText = await currentValueSpan.InnerTextAsync();
+                        if (currentText.Trim() == sortOrder)
+                        {
+                            LoggerHelper.LogInformation($"{sortOrder} zaten seçili!");
+                            return;
+                        }
+                    }
+
+                    await sortCombobox.ClickAsync();
+                    await Task.Delay(1500);
+
+                    var dropdownMenu = await _page.WaitForSelectorAsync(
+                        "[role='listbox'][data-slot='select-content'], " +
+                        "[data-slot='select-content'], " +
+                        "[role='listbox']",
+                        new PageWaitForSelectorOptions { Timeout = 3000 });
+
+                    if (dropdownMenu != null)
+                    {
+                        var targetOption = await dropdownMenu.QuerySelectorAsync(
+                            $"[role='option']:has-text('{sortOrder}'), " +
+                            $"[data-slot='select-item']:has-text('{sortOrder}')");
+
+                        if (targetOption != null)
+                        {
+                            await targetOption.ClickAsync();
+                            LoggerHelper.LogInformation($"{sortOrder} seçildi.");
+                        }
+                        await Task.Delay(1000);
+                    }
+                }
             }
             catch (Exception ex)
             {
-                LoggerHelper.LogError(ex, "Durum filtresi ayarlama hatası");
-                throw;
+                LoggerHelper.LogError(ex, "Sıralama filtresi ayarlama hatası");
             }
         }
 
-        private async Task ApplyTransactionTypeFilterAsync(string transactionType)
+        // İŞLEM TÜRÜ FİLTRESİ
+        public async Task ApplyTransactionTypeFilterAsync(string transactionType)
         {
             try
             {
-                // Tüm combobox butonlarını bul
+                LoggerHelper.LogInformation($"İşlem türü filtresi uygulanıyor: {transactionType}");
+
                 var comboboxes = await _page.QuerySelectorAllAsync(
                     "button[role='combobox'][data-slot='select-trigger'], " +
                     "button[role='combobox']");
@@ -568,90 +818,154 @@ namespace Proje.Service
                 {
                     try
                     {
-                        // Combobox içindeki metni kontrol et
                         var span = await combobox.QuerySelectorAsync("span[data-slot='select-value']");
                         if (span != null)
                         {
                             var currentText = await span.InnerTextAsync();
 
-                            // Eğer bu combobox'ın metni "Yatırım", "Çekim" ise bu işlem türü combobox'ıdır
-                            if (currentText == "Yatırım" ||
-                                currentText == "Çekim" ||
-                                currentText.Contains("Yatırım") ||
-                                currentText.Contains("Çekim"))
+                            if (currentText == "Yatırım" || currentText == "Çekim" || currentText.Contains("Hepsi"))
                             {
-                                LoggerHelper.LogInformation($"İşlem türü combobox'ı bulundu: {currentText} -> {transactionType} olarak değiştiriliyor");
-
                                 await combobox.ClickAsync();
-                                await Task.Delay(800);
+                                await Task.Delay(1000);
 
-                                // Option listesini bekle
-                                await _page.WaitForSelectorAsync("[role='option'], [data-radix-select-viewport]",
+                                var dropdownMenu = await _page.WaitForSelectorAsync(
+                                    "[role='listbox'], " +
+                                    "[data-slot='select-content']",
                                     new PageWaitForSelectorOptions { Timeout = 3000 });
-                                await Task.Delay(500);
 
-                                // İstenen option'ı bul ve tıkla
-                                var option = await _page.QuerySelectorAsync(
-                                    $"[role='option']:has-text('{transactionType}'), " +
-                                    $"[data-radix-select-viewport] :text('{transactionType}')");
-
-                                if (option != null)
+                                if (dropdownMenu != null)
                                 {
-                                    await option.ClickAsync();
-                                    LoggerHelper.LogInformation($"İşlem türü '{transactionType}' olarak ayarlandı.");
-                                }
-                                else
-                                {
-                                    LoggerHelper.LogWarning($"'{transactionType}' seçeneği bulunamadı!");
-                                    await _page.Keyboard.PressAsync("Escape");
-                                }
+                                    var option = await dropdownMenu.QuerySelectorAsync(
+                                        $"[role='option']:has-text('{transactionType}'), " +
+                                        $"[data-slot='select-item']:has-text('{transactionType}')");
 
-                                await Task.Delay(500);
-                                return; // İlk bulduğumuz işlem türü combobox'ı ile işlem yap
+                                    if (option != null)
+                                    {
+                                        await option.ClickAsync();
+                                        LoggerHelper.LogInformation($"İşlem türü '{transactionType}' olarak ayarlandı.");
+                                    }
+                                }
+                                return;
                             }
                         }
                     }
                     catch { continue; }
                 }
-
-                LoggerHelper.LogWarning("İşlem türü filtresi combobox'ı bulunamadı!");
             }
             catch (Exception ex)
             {
                 LoggerHelper.LogError(ex, "İşlem türü filtresi ayarlama hatası");
-                throw;
             }
         }
 
+        // DURUM FİLTRESİ
+        private async Task ApplyStatusFilterAsync(string status)
+        {
+            try
+            {
+                var comboboxes = await _page.QuerySelectorAllAsync(
+                    "button[role='combobox'][data-slot='select-trigger'], " +
+                    "button[role='combobox']");
+
+                foreach (var combobox in comboboxes)
+                {
+                    try
+                    {
+                        var span = await combobox.QuerySelectorAsync("span[data-slot='select-value']");
+                        if (span != null)
+                        {
+                            var currentText = await span.InnerTextAsync();
+
+                            if (currentText == "Tümü" || currentText == "Onaylandı" || currentText == "Hepsi")
+                            {
+                                await combobox.ClickAsync();
+                                await Task.Delay(1000);
+
+                                var dropdownMenu = await _page.WaitForSelectorAsync(
+                                    "[role='listbox'], " +
+                                    "[data-slot='select-content']",
+                                    new PageWaitForSelectorOptions { Timeout = 3000 });
+
+                                if (dropdownMenu != null)
+                                {
+                                    var option = await dropdownMenu.QuerySelectorAsync(
+                                        $"[role='option']:has-text('{status}'), " +
+                                        $"[data-slot='select-item']:has-text('{status}')");
+
+                                    if (option != null)
+                                    {
+                                        await option.ClickAsync();
+                                        LoggerHelper.LogInformation($"Durum '{status}' olarak ayarlandı.");
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    catch { continue; }
+                }
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Durum filtresi ayarlama hatası");
+            }
+        }
+
+        // ARA BUTONUNA TIKLA - KESİN ÇÖZÜM
         private async Task ClickSearchButtonAsync()
         {
             try
             {
-                // Ara butonunu bul (funnel icon'lu buton)
-                var searchButton = await _page.WaitForSelectorAsync(
-                    "button:has(svg.lucide-funnel), " +
-                    "button:has-text('Ara'), " +
-                    "[data-slot='button']:has(svg.lucide-funnel)",
-                    new PageWaitForSelectorOptions { Timeout = 5000 });
+                LoggerHelper.LogInformation("Ara butonu aranıyor...");
 
-                if (searchButton != null && await searchButton.IsVisibleAsync())
+                // TÜM OLASI ARA BUTONLARINI DENE
+                var searchButtonSelectors = new[]
+                {
+                    "button:has(svg.lucide-funnel)",
+                    "button:has-text('Ara')",
+                    "[data-slot='button']:has(svg.lucide-funnel)",
+                    "button:has-text('Filtrele')",
+                    "button[type='submit']:has-text('Ara')",
+                    "button[type='button']:has-text('Ara')",
+                    "button.btn-primary:has-text('Ara')",
+                    "button.bg-primary:has-text('Ara')"
+                };
+
+                IElementHandle searchButton = null;
+
+                foreach (var selector in searchButtonSelectors)
+                {
+                    try
+                    {
+                        var button = await _page.QuerySelectorAsync(selector);
+                        if (button != null && await button.IsVisibleAsync())
+                        {
+                            searchButton = button;
+                            LoggerHelper.LogInformation($"Ara butonu bulundu: {selector}");
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (searchButton != null)
                 {
                     LoggerHelper.LogInformation("Ara butonuna tıklanıyor...");
                     await searchButton.ClickAsync();
 
                     // Filtrelerin uygulanmasını bekle
                     await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
-                    await Task.Delay(3000);
+                    await Task.Delay(4000);
 
                     // Tablonun güncellendiğini kontrol et
                     var tableRows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
-                    LoggerHelper.LogInformation($"✅ Filtreler uygulandı. {tableRows.Count} satır bulundu.");
+                    LoggerHelper.LogInformation($"✅ Ara butonuna tıklandı. {tableRows.Count} satır bulundu.");
                 }
                 else
                 {
-                    LoggerHelper.LogWarning("Ara butonu bulunamadı! Enter tuşunu deneyelim...");
+                    LoggerHelper.LogWarning("Ara butonu bulunamadı! Enter tuşuna basılıyor...");
                     await _page.Keyboard.PressAsync("Enter");
-                    await Task.Delay(2000);
+                    await Task.Delay(3000);
                 }
             }
             catch (Exception ex)
@@ -660,10 +974,13 @@ namespace Proje.Service
             }
         }
 
+        // İŞLEMLERİ FİLTRE İLE ÇEK
         public async Task<List<Transaction>> ExtractTransactionsWithFilterAsync(
             string status = "Onaylandı",
             string transactionType = "Yatırım",
-            bool autoPaginate = false)
+            bool autoPaginate = false,
+            DateTime? selectedDate = null,
+            string sortOrder = "Eskiden Yeniye")
         {
             var allTransactions = new List<Transaction>();
             int currentPage = 1;
@@ -671,14 +988,14 @@ namespace Proje.Service
 
             try
             {
-                LoggerHelper.LogInformation($"Filtreli işlem çekme başlatılıyor: {status}, {transactionType}");
+                LoggerHelper.LogInformation($"Filtreli işlem çekme başlatılıyor: {status}, {transactionType}, Tarih: {selectedDate}, Sıralama: {sortOrder}");
 
                 // 1. Önce sayfanın tamamen yüklendiğinden emin ol
                 await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
                 await Task.Delay(2000);
 
-                // 2. Filtreleri uygula
-                await ApplyFiltersAsync(status, transactionType);
+                // 2. TÜM FİLTRELERİ UYGULA VE ARA BUTONUNA TIKLA
+                await ApplyFiltersAsync(status, transactionType, selectedDate, sortOrder);
                 await Task.Delay(2000);
 
                 while (currentPage <= maxPages)
@@ -713,14 +1030,13 @@ namespace Proje.Service
                                 var transaction = await ExtractTransactionFromRowAsync(row);
                                 if (transaction != null && transaction.Status == status)
                                 {
-                                    // Bu işlemi daha önce işledik mi kontrol et
+                                    transaction.TransactionType = transactionType;
+
                                     if (_processedTransactionIds.Contains(transaction.TransactionId ?? transaction.TransactionNo))
                                     {
-                                        LoggerHelper.LogInformation($"İşlem {transaction.TransactionNo} zaten işlenmiş, atlanıyor.");
                                         continue;
                                     }
 
-                                    // Modal detayları al (eğer buton varsa)
                                     var detailButton = await row.QuerySelectorAsync(
                                         "button[data-slot='sheet-trigger'], " +
                                         "button:has-text('Detaylı Görüntüle'), " +
@@ -729,16 +1045,14 @@ namespace Proje.Service
                                     if (detailButton != null && await detailButton.IsVisibleAsync())
                                     {
                                         await detailButton.ClickAsync();
-                                        await Task.Delay(2000); // Modal'ın yüklenmesi için daha fazla zaman
-                                        await ExtractModalDetailsAsync(transaction);
+                                        await Task.Delay(2000);
+                                        await ExtractModalDetailsAsync(transaction, transactionType);
                                         await CloseModalAsync();
                                     }
 
-                                    // Google Sheets'e yaz
                                     await WriteTransactionToGoogleSheetAsync(transaction, transactionType);
                                     allTransactions.Add(transaction);
                                     newTransactions++;
-                                    LoggerHelper.LogInformation($"✅ İşlem eklendi: {transaction.TransactionNo}");
                                 }
                             }
                             catch (Exception ex)
@@ -754,7 +1068,6 @@ namespace Proje.Service
                         {
                             if (!await NavigateToNextPageAsync(currentPage))
                             {
-                                LoggerHelper.LogInformation("Son sayfaya ulaşıldı veya sayfa geçişi başarısız.");
                                 break;
                             }
                             currentPage++;
@@ -771,7 +1084,7 @@ namespace Proje.Service
                     }
                 }
 
-                LoggerHelper.LogInformation($"✅ {allTransactions.Count} adet işlem başarıyla çekildi! {currentPage} sayfa işlendi.");
+                LoggerHelper.LogInformation($"✅ {allTransactions.Count} adet işlem başarıyla çekildi!");
                 return allTransactions;
             }
             catch (Exception ex)
@@ -781,6 +1094,7 @@ namespace Proje.Service
             }
         }
 
+        // KALAN METODLAR (DEĞİŞMEDİ)
         public async Task<List<Transaction>> ExtractTransactionsAsync(int pageCount = 10)
         {
             return await ExtractTransactionsWithFilterAsync("Onaylandı", "Yatırım", false);
@@ -792,67 +1106,42 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation($"Sonraki sayfaya geçiliyor... (Mevcut: {currentPage})");
 
-                // HTML'deki pagination yapısını bul
                 var pagination = await _page.QuerySelectorAsync(
                     "nav[role='navigation'][aria-label='pagination'], " +
                     "[data-slot='pagination']");
 
                 if (pagination == null)
                 {
-                    LoggerHelper.LogWarning("Pagination yapısı bulunamadı.");
                     return false;
                 }
 
-                // "Sonraki" butonunu bul
                 var nextButton = await pagination.QuerySelectorAsync(
                     "a:has-text('Sonraki'), " +
                     "button:has-text('Sonraki'), " +
                     "[data-slot='pagination-link']:has-text('Sonraki'), " +
-                    "[aria-label*='next'], " +
-                    "[aria-label*='Next']");
+                    "[aria-label*='next']");
 
                 if (nextButton != null && await nextButton.IsVisibleAsync())
                 {
-                    // Butonun disabled olup olmadığını kontrol et
                     var isDisabled = await nextButton.EvaluateAsync<bool>(@"
                         element => {
                             if (element.disabled) return true;
                             if (element.getAttribute('disabled') !== null) return true;
                             if (element.getAttribute('aria-disabled') === 'true') return true;
-                            if (element.classList.contains('disabled')) return true;
-                            if (element.classList.contains('pointer-events-none')) return true;
-                            if (window.getComputedStyle(element).pointerEvents === 'none') return true;
-                            if (window.getComputedStyle(element).opacity === '0.5') return true;
                             return false;
                         }
                     ");
 
                     if (!isDisabled)
                     {
-                        LoggerHelper.LogInformation("Sonraki sayfa butonu bulundu, tıklanıyor...");
                         await nextButton.ClickAsync();
-
-                        // Yeni sayfanın yüklenmesini bekle
                         await _page.WaitForLoadStateAsync(LoadState.NetworkIdle);
                         await Task.Delay(3000);
-
-                        // Tablonun yeni verilerle dolmasını bekle
                         await WaitForTableToLoadAsync();
-
-                        LoggerHelper.LogInformation("✅ Sayfa başarıyla değişti.");
                         return true;
                     }
-                    else
-                    {
-                        LoggerHelper.LogInformation("Sonraki sayfa butonu devre dışı (muhtemelen son sayfadayız).");
-                        return false;
-                    }
                 }
-                else
-                {
-                    LoggerHelper.LogWarning("Sonraki sayfa butonu bulunamadı veya görünür değil.");
-                    return false;
-                }
+                return false;
             }
             catch (Exception ex)
             {
@@ -871,14 +1160,12 @@ namespace Proje.Service
 
                 while (stopwatch.Elapsed.TotalSeconds < timeoutSeconds)
                 {
-                    // Tablo body'sini kontrol et
                     var tbody = await _page.QuerySelectorAsync(
                         "tbody[data-slot='table-body'], " +
                         "tbody");
 
                     if (tbody != null)
                     {
-                        // Satırları kontrol et
                         var rows = await tbody.QuerySelectorAllAsync(
                             "tr[data-slot='table-row'], " +
                             "tr");
@@ -889,11 +1176,8 @@ namespace Proje.Service
                             return;
                         }
                     }
-
                     await Task.Delay(500);
                 }
-
-                LoggerHelper.LogWarning($"Tablo yüklenmesi {timeoutSeconds} saniye içinde tamamlanamadı.");
             }
             catch (Exception ex)
             {
@@ -901,65 +1185,96 @@ namespace Proje.Service
             }
         }
 
+        
+        // GÜNCELLENMİŞ: ProcessTransactionsCycleAsync - İş akışına uygun
         public async Task ProcessTransactionsCycleAsync(CancellationToken cancellationToken)
         {
-            while (!cancellationToken.IsCancellationRequested)
+            try
             {
-                try
+                LoggerHelper.LogInformation("=== YENİ İŞLEM DÖNGÜSÜ BAŞLATILIYOR ===");
+
+                // 1. Login durumunu kontrol et
+                if (!await IsLoggedInAsync())
                 {
-                    LoggerHelper.LogInformation("=== YENİ İŞLEM DÖNGÜSÜ BAŞLATILIYOR ===");
-
-                    // İşlenen işlem listesini temizle (isteğe bağlı)
-                    _processedTransactionCount = 0;
-
-                    // 1. Yatırım işlemlerini işle
-                    LoggerHelper.LogInformation("=== YATIRIM İŞLEMLERİ İŞLENİYOR ===");
-                    var yatirimTransactions = await ExtractTransactionsWithFilterAsync(
-                        status: "Onaylandı",
-                        transactionType: "Yatırım",
-                        autoPaginate: true);
-
-                    LoggerHelper.LogInformation($"{yatirimTransactions.Count} adet Yatırım işlemi işlendi.");
-
-                    // 2. Çekim işlemlerini işle
-                    LoggerHelper.LogInformation("=== ÇEKİM İŞLEMLERİ İŞLENİYOR ===");
-                    var cekimTransactions = await ExtractTransactionsWithFilterAsync(
-                        status: "Onaylandı",
-                        transactionType: "Çekim",
-                        autoPaginate: true);
-
-                    LoggerHelper.LogInformation($"{cekimTransactions.Count} adet Çekim işlemi işlendi.");
-
-                    // 3. Toplam işlem sayısını logla
-                    int totalTransactions = yatirimTransactions.Count + cekimTransactions.Count;
-                    LoggerHelper.LogInformation($"=== TOPLAM İŞLENEN İŞLEM: {totalTransactions} ===");
-
-                    // 4. İşlem sayısını sıfırla (bir sonraki döngü için)
-                    _processedTransactionCount = 0;
-
-                    // 5. 5 dakika bekle
-                    LoggerHelper.LogInformation("5 dakika bekleniyor...");
-                    await Task.Delay(TimeSpan.FromMinutes(5), cancellationToken);
+                    LoggerHelper.LogInformation("Oturum kapalı, yeniden login yapılıyor...");
+                    await LoginAsync();
+                    await NavigateToTransactionHistoryAsync();
                 }
-                catch (Exception ex) when (!(ex is TaskCanceledException))
+
+                // 2. Yatırım işlemlerini işle
+                LoggerHelper.LogInformation("=== YATIRIM İŞLEMLERİ İŞLENİYOR ===");
+                var yatirimTransactions = await ExtractTransactionsWithFilterAsync(
+                    status: "Onaylandı",
+                    transactionType: "Yatırım",
+                    autoPaginate: true,
+                    selectedDate: _lastDepositDate ?? _initialSelectedDate,
+                    sortOrder: _initialSortOrder);
+
+                if (yatirimTransactions.Any())
                 {
-                    LoggerHelper.LogError(ex, "İşlem döngüsünde hata. 1 dakika sonra tekrar denenecek.");
-                    await Task.Delay(TimeSpan.FromMinutes(1), cancellationToken);
+                    _lastDepositDate = yatirimTransactions.Max(t => t.LastApprovalDate);
+                    LoggerHelper.LogInformation($"{yatirimTransactions.Count} adet Yatırım işlemi işlendi. Son tarih: {_lastDepositDate}");
                 }
+
+                // 3. Çekim işlemlerini işle
+                LoggerHelper.LogInformation("=== ÇEKİM İŞLEMLERİ İŞLENİYOR ===");
+                var cekimTransactions = await ExtractTransactionsWithFilterAsync(
+                    status: "Onaylandı",
+                    transactionType: "Çekim",
+                    autoPaginate: true,
+                    selectedDate: _lastWithdrawalDate ?? _initialSelectedDate,
+                    sortOrder: _initialSortOrder);
+
+                if (cekimTransactions.Any())
+                {
+                    _lastWithdrawalDate = cekimTransactions.Max(t => t.LastApprovalDate);
+                    LoggerHelper.LogInformation($"{cekimTransactions.Count} adet Çekim işlemi işlendi. Son tarih: {_lastWithdrawalDate}");
+                }
+
+                int totalTransactions = yatirimTransactions.Count + cekimTransactions.Count;
+                LoggerHelper.LogInformation($"=== TOPLAM İŞLENEN İŞLEM: {totalTransactions} ===");
+            }
+            catch (Exception ex) when (!(ex is TaskCanceledException))
+            {
+                LoggerHelper.LogError(ex, "İşlem döngüsünde hata");
+                throw;
             }
         }
 
-        public void StartContinuousProcessing()
+        // GÜNCELLENMİŞ: StartContinuousProcessing - Parametre alacak şekilde
+        public void StartContinuousProcessing(DateTime selectedDate, string sortOrder)
         {
-            _processingCts = new CancellationTokenSource();
-            var processingTask = ProcessTransactionsCycleAsync(_processingCts.Token);
-            LoggerHelper.LogInformation("Sürekli işlem döngüsü başlatıldı.");
+            try
+            {
+                _initialSelectedDate = selectedDate;
+                _initialSortOrder = sortOrder;
+
+                _processingCts = new CancellationTokenSource();
+                var processingTask = ProcessTransactionsCycleAsync(_processingCts.Token);
+
+                LoggerHelper.LogInformation($"Sürekli işlem döngüsü başlatıldı. Tarih: {selectedDate}, Sıralama: {sortOrder}");
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Sürekli işlem başlatma hatası");
+                throw;
+            }
         }
 
         public void StopContinuousProcessing()
         {
-            _processingCts?.Cancel();
-            LoggerHelper.LogInformation("Sürekli işlem döngüsü durduruldu.");
+            try
+            {
+                _processingCts?.Cancel();
+                _processingCts?.Dispose();
+                _processingCts = null;
+
+                LoggerHelper.LogInformation("Sürekli işlem döngüsü durduruldu.");
+            }
+            catch (Exception ex)
+            {
+                LoggerHelper.LogError(ex, "Sürekli işlem durdurma hatası");
+            }
         }
 
         private async Task<Transaction> ExtractTransactionFromRowAsync(IElementHandle row)
@@ -968,7 +1283,6 @@ namespace Proje.Service
             {
                 var transaction = new Transaction();
 
-                // 1. İşlem No (3 buton: yeşil, turuncu, mavi)
                 var transactionNoElements = await row.QuerySelectorAllAsync("td:nth-child(1) button");
                 if (transactionNoElements.Count >= 3)
                 {
@@ -977,7 +1291,6 @@ namespace Proje.Service
                     transaction.CustomerRefNo = await ExtractTextFromButtonAsync(transactionNoElements[2]);
                 }
 
-                // 2. Müşteri Bilgileri
                 var customerElements = await row.QuerySelectorAllAsync("td:nth-child(2) button");
                 if (customerElements.Count >= 2)
                 {
@@ -985,7 +1298,6 @@ namespace Proje.Service
                     transaction.CustomerName = await ExtractTextFromButtonAsync(customerElements[1]);
                 }
 
-                // 3. Tutar Bilgileri
                 var amountElements = await row.QuerySelectorAllAsync("td:nth-child(3) button");
                 if (amountElements.Count >= 2)
                 {
@@ -996,7 +1308,6 @@ namespace Proje.Service
                     transaction.ResultAmount = ParseAmount(resultAmountText);
                 }
 
-                // 4. Personel Bilgileri
                 var employeeCell = await row.QuerySelectorAsync("td:nth-child(4)");
                 if (employeeCell != null)
                 {
@@ -1009,7 +1320,6 @@ namespace Proje.Service
                     }
                 }
 
-                // 5. Durum
                 var statusCell = await row.QuerySelectorAsync("td:nth-child(5)");
                 if (statusCell != null)
                 {
@@ -1028,7 +1338,6 @@ namespace Proje.Service
                     }
                 }
 
-                // 6. Tarihler
                 var datesCell = await row.QuerySelectorAsync("td:nth-child(6)");
                 if (datesCell != null)
                 {
@@ -1107,10 +1416,6 @@ namespace Proje.Service
                         var dateStr = line.Replace("Onay:", "").Trim();
                         transaction.LastApprovalDate = ParseTurkishDateTime(dateStr);
                     }
-                    else if (line.Contains("Güncelleme:"))
-                    {
-                        // İsteğe bağlı: güncelleme tarihini kaydet
-                    }
                     else if (line.Contains("Reddedildi:"))
                     {
                         var dateStr = line.Replace("Reddedildi:", "").Trim();
@@ -1140,7 +1445,7 @@ namespace Proje.Service
             }
         }
 
-        private async Task ExtractModalDetailsAsync(Transaction transaction)
+        private async Task ExtractModalDetailsAsync(Transaction transaction, string transactionType)
         {
             try
             {
@@ -1156,13 +1461,10 @@ namespace Proje.Service
                     return;
                 }
 
-                // Modal içeriğini HTML olarak al
                 var modalHtml = await modal.InnerHTMLAsync();
+                ParseModalHtml(modalHtml, transaction, transactionType);
 
-                // HTML'den gerekli verileri parse et
-                ParseModalHtml(modalHtml, transaction);
-
-                LoggerHelper.LogInformation($"{transaction.TransactionNo} modal detayları alındı.");
+                LoggerHelper.LogInformation($"{transaction.TransactionNo} modal detayları alındı. Tür: {transactionType}");
             }
             catch (Exception ex)
             {
@@ -1170,59 +1472,64 @@ namespace Proje.Service
             }
         }
 
-        private void ParseModalHtml(string modalHtml, Transaction transaction)
+        // GÜNCELLENMİŞ: ParseModalHtml - Çekim modal bilgilerini doğru şekilde parse eder
+        private void ParseModalHtml(string modalHtml, Transaction transaction, string transactionType)
         {
             try
             {
-                // 1. İşlem ID (H sütunu)
-                var transactionIdMatch = System.Text.RegularExpressions.Regex.Match(
+                // 1. İşlem ID (I sütunu)
+                var transactionIdMatch = Regex.Match(
                     modalHtml,
                     @"İşlem ID.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
-                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
 
                 if (transactionIdMatch.Success)
                 {
                     transaction.TransactionId = transactionIdMatch.Groups[1].Value.Trim();
+                    LoggerHelper.LogInformation($"İşlem ID bulundu: {transaction.TransactionId}");
                 }
 
-                // 2. İsim Soyisim (C sütunu)
-                var fullNameMatch = System.Text.RegularExpressions.Regex.Match(
+                // 2. İsim Soyisim (D sütununa)
+                var fullNameMatch = Regex.Match(
                     modalHtml,
                     @"İsim Soyisim.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
-                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
 
                 if (fullNameMatch.Success)
                 {
                     transaction.FullName = fullNameMatch.Groups[1].Value.Trim();
+                    LoggerHelper.LogInformation($"İsim Soyisim bulundu: {transaction.FullName}");
                 }
 
-                // 3. Banka (D sütunu) - img'den sonraki div'deki metin
-                var bankMatch = System.Text.RegularExpressions.Regex.Match(
+                // 3. Banka Bilgisi - E sütununa
+                var bankMatch = Regex.Match(
                     modalHtml,
-                    @"<img[^>]+>.*?<div class=""flex flex-col gap-1 text-right mr-8"">.*?<div></div>.*?<div>([^<]+)</div>",
-                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                    @"<div class=""flex flex-col gap-1 text-right mr-8"">.*?<div></div>.*?<div>([^<]+)</div>",
+                    RegexOptions.Singleline);
 
                 if (bankMatch.Success)
                 {
                     transaction.BankName = bankMatch.Groups[1].Value.Trim();
+                    LoggerHelper.LogInformation($"Banka bulundu: {transaction.BankName}");
                 }
 
-                // 4. IBAN Sahibi (E sütunu)
-                var ibanHolderMatch = System.Text.RegularExpressions.Regex.Match(
+                // 4. İban Sahibi - F sütununa
+                var ibanHolderMatch = Regex.Match(
                     modalHtml,
                     @"IBAN Sahibi.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
-                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
 
                 if (ibanHolderMatch.Success)
                 {
                     transaction.AccountHolder = ibanHolderMatch.Groups[1].Value.Trim();
+                    LoggerHelper.LogInformation($"IBAN Sahibi bulundu: {transaction.AccountHolder}");
                 }
 
-                // 5. Sonuç Tutarı (F sütunu)
-                var amountMatch = System.Text.RegularExpressions.Regex.Match(
+                // 5. Sonuç Tutarı - G sütununa (Çekim için -₺ olacak)
+                var amountMatch = Regex.Match(
                     modalHtml,
                     @"Sonuç Tutarı.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
-                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
 
                 if (amountMatch.Success)
                 {
@@ -1230,25 +1537,35 @@ namespace Proje.Service
                     if (decimal.TryParse(amountText, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal resultAmount))
                     {
                         transaction.ResultAmount = resultAmount;
+                        LoggerHelper.LogInformation($"Sonuç Tutarı bulundu: {resultAmount}");
                     }
                 }
 
-                // 6. Son Onay Tarihi (B sütunu) - GG.AA.YYYY formatında
-                var lastApprovalMatch = System.Text.RegularExpressions.Regex.Match(
+                // 6. Son Onay Tarihi - B ve C sütunları için
+                var lastApprovalMatch = Regex.Match(
                     modalHtml,
                     @"Son Onay Tarihi.*?font-medium text-primary text-xs.*?<div>([^<]+)</div>",
-                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                    RegexOptions.Singleline | RegexOptions.IgnoreCase);
 
                 if (lastApprovalMatch.Success)
                 {
                     transaction.LastApprovalDateFormatted = lastApprovalMatch.Groups[1].Value.Trim();
+                    LoggerHelper.LogInformation($"Son Onay Tarihi bulundu: {transaction.LastApprovalDateFormatted}");
                 }
 
                 // 7. IBAN
-                var ibanMatch = System.Text.RegularExpressions.Regex.Match(modalHtml, @"TR\d{24}");
+                var ibanMatch = Regex.Match(modalHtml, @"TR\d{24}");
                 if (ibanMatch.Success)
                 {
                     transaction.IBAN = ibanMatch.Value;
+                    LoggerHelper.LogInformation($"IBAN bulundu: {transaction.IBAN}");
+                }
+
+                // Çekim için tutarı negatif yap (WriteTransactionToGoogleSheetAsync'da -₺ ekleniyor)
+                if (transactionType == "Çekim" && transaction.ResultAmount > 0)
+                {
+                    // WriteTransactionToGoogleSheetAsync metodunda zaten -₺ eklenecek
+                    LoggerHelper.LogInformation($"Çekim işlemi tutarı: {transaction.ResultAmount} (Excel'e -₺ olarak yazılacak)");
                 }
             }
             catch (Exception ex)
@@ -1293,7 +1610,6 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation("Bağlantı testi başlatılıyor...");
 
-                // 1. İnternet bağlantısı testi
                 bool internetConnected = false;
 
                 using (var ping = new Ping())
@@ -1327,7 +1643,6 @@ namespace Proje.Service
 
                 LoggerHelper.LogInformation("✓ İnternet bağlantısı başarılı");
 
-                // 2. Hedef siteye bağlantı testi
                 using var httpClient = new HttpClient();
                 httpClient.Timeout = TimeSpan.FromSeconds(10);
 
@@ -1368,19 +1683,18 @@ namespace Proje.Service
 
         public async Task<bool> IsLoggedInAsync()
         {
+            // Önce bellekteki durumu kontrol et
+            if (!_isLoggedIn) return false;
+
+            // Sonra sayfayı kontrol et (çift kontrol)
             try
             {
                 var currentUrl = _page.Url;
-                var content = await _page.ContentAsync();
-
-                return !currentUrl.Contains("login") &&
-                       !currentUrl.Contains("auth") &&
-                       !content.Contains("Giriş Yap") &&
-                       !content.Contains("401") &&
-                       !content.Contains("403");
+                return !currentUrl.Contains("login") && !currentUrl.Contains("auth");
             }
             catch
             {
+                _isLoggedIn = false;
                 return false;
             }
         }
@@ -1391,25 +1705,20 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation($"İşlem detayları alınıyor: {transactionId}");
 
-                // İşlem Geçmişi sayfasına git
                 if (!await NavigateToTransactionHistoryAsync())
                 {
                     LoggerHelper.LogWarning("İşlem Geçmişi sayfasına ulaşılamadı.");
                     return null;
                 }
 
-                // Arama alanına işlem ID'sini yaz
                 var searchInput = await _page.QuerySelectorAsync("input[placeholder='Ara...']");
                 if (searchInput != null)
                 {
                     await searchInput.FillAsync(transactionId);
                     await Task.Delay(1000);
-
-                    // Ara butonuna tıkla
                     await ClickSearchButtonAsync();
                 }
 
-                // Tablodaki satırları kontrol et
                 var rows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
                 foreach (var row in rows)
                 {
@@ -1422,13 +1731,12 @@ namespace Proje.Service
                             var transaction = await ExtractTransactionFromRowAsync(row);
                             if (transaction != null && transaction.Status == "Onaylandı")
                             {
-                                // Modal detayları al
                                 var detailButton = await row.QuerySelectorAsync("td:nth-child(7) button[data-slot='sheet-trigger']");
                                 if (detailButton != null)
                                 {
                                     await detailButton.ClickAsync();
                                     await Task.Delay(1500);
-                                    await ExtractModalDetailsAsync(transaction);
+                                    await ExtractModalDetailsAsync(transaction, transaction.TransactionType ?? "Yatırım");
                                     await CloseModalAsync();
                                 }
                                 return transaction;
@@ -1453,14 +1761,11 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation("=== PAGINATION TESTİ BAŞLATILIYOR ===");
 
-                // İşlem Geçmişi sayfasına git
                 if (!await NavigateToTransactionHistoryAsync())
                     return false;
 
-                // Filtreleri uygula
                 await ApplyFiltersAsync("Onaylandı", "Yatırım");
 
-                // 1. Sayfadaki satırları say
                 var page1Rows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
                 LoggerHelper.LogInformation($"1. sayfada {page1Rows.Count} satır bulundu.");
 
@@ -1470,21 +1775,17 @@ namespace Proje.Service
                     return false;
                 }
 
-                // İlk satırın içeriğini kaydet
                 var firstRowPage1 = await page1Rows[0].InnerHTMLAsync();
 
-                // 2. Sonraki sayfaya gitmeyi dene
                 bool canNavigate = await NavigateToNextPageAsync(1);
 
                 if (canNavigate)
                 {
-                    // 2. Sayfadaki satırları say
                     var page2Rows = await _page.QuerySelectorAllAsync("tbody tr[data-slot='table-row']");
                     LoggerHelper.LogInformation($"2. sayfada {page2Rows.Count} satır bulundu.");
 
                     if (page2Rows.Count > 0)
                     {
-                        // İlk satırların içeriğini karşılaştır
                         var firstRowPage2 = await page2Rows[0].InnerHTMLAsync();
 
                         if (firstRowPage1 != firstRowPage2)
@@ -1523,7 +1824,6 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation("Sayfa varsayılan duruma getiriliyor...");
 
-                // 1. Sayfayı yenile
                 await _page.ReloadAsync(new PageReloadOptions
                 {
                     WaitUntil = WaitUntilState.NetworkIdle,
@@ -1531,10 +1831,8 @@ namespace Proje.Service
                 });
                 await Task.Delay(2000);
 
-                // 2. Tüm açık modal veya açılır pencereleri kapat
                 await CloseAllModalsAsync();
 
-                // 3. Filtreleri temizle
                 await ClearTransactionFiltersAsync();
 
                 LoggerHelper.LogInformation("✅ Sayfa varsayılan duruma getirildi.");
@@ -1553,10 +1851,8 @@ namespace Proje.Service
             {
                 LoggerHelper.LogInformation("İşlem filtreleri temizleniyor...");
 
-                // 1. Önce filtre bölümünün yüklenmesini bekle
                 await Task.Delay(1000);
 
-                // 2. Tüm combobox'ları bul ve "Tümü" yap
                 var comboboxes = await _page.QuerySelectorAllAsync(
                     "button[role='combobox'][data-slot='select-trigger'], " +
                     "button[role='combobox']");
@@ -1567,30 +1863,24 @@ namespace Proje.Service
                 {
                     try
                     {
-                        // Combobox'ın görünür olup olmadığını kontrol et
                         if (!await combobox.IsVisibleAsync())
                             continue;
 
                         await combobox.ClickAsync();
                         await Task.Delay(500);
 
-                        // "Tümü" seçeneğini ara
                         var tumuOption = await _page.QuerySelectorAsync(
                             "[role='option']:has-text('Tümü'), " +
-                            "[role='option']:has-text('Tüm Durumlar'), " +
                             "[role='option']:has-text('Hepsi'), " +
-                            "[data-radix-select-viewport] :text('Tümü'), " +
-                            "[data-radix-select-viewport] :text('Tüm Durumlar'), " +
-                            "[data-radix-select-viewport] :text('Hepsi')");
+                            "[role='option']:has-text('Tüm Durumlar')");
 
                         if (tumuOption != null)
                         {
                             await tumuOption.ClickAsync();
-                            LoggerHelper.LogInformation("Combobox 'Tümü' olarak ayarlandı.");
+                            LoggerHelper.LogInformation("Combobox 'Tümü/Hepsi' olarak ayarlandı.");
                         }
                         else
                         {
-                            // "Tümü" bulunamazsa, ilk seçeneği seç veya Escape tuşuna bas
                             var firstOption = await _page.QuerySelectorAsync("[role='option']:first-child");
                             if (firstOption != null)
                             {
@@ -1607,15 +1897,12 @@ namespace Proje.Service
                     catch (Exception ex)
                     {
                         LoggerHelper.LogError(ex, "Combobox temizleme hatası");
-                        // Hata durumunda Escape tuşuna bas
                         await _page.Keyboard.PressAsync("Escape");
                     }
                 }
 
-                // 3. Tarih filtrelerini temizle (eğer varsa)
                 await ClearDateFiltersAsync();
 
-                // 4. Arama inputlarını temizle
                 var searchInputs = await _page.QuerySelectorAllAsync(
                     "input[placeholder*='Ara'], " +
                     "input[type='search'], " +
@@ -1634,10 +1921,7 @@ namespace Proje.Service
                     catch { }
                 }
 
-                // 5. Ara butonuna tıkla veya Enter tuşuna bas
                 await ClickSearchButtonAsync();
-
-                // 6. Filtrelerin temizlenmesini bekle
                 await Task.Delay(1500);
 
                 LoggerHelper.LogInformation("✅ İşlem filtreleri başarıyla temizlendi.");
@@ -1654,11 +1938,9 @@ namespace Proje.Service
         {
             try
             {
-                // Escape tuşuna basarak açık modal varsa kapat
                 await _page.Keyboard.PressAsync("Escape");
                 await Task.Delay(500);
 
-                // Close butonlarını kontrol et
                 var closeButtons = await _page.QuerySelectorAllAsync(
                     "button[aria-label='Close'], " +
                     "button[data-slot='close-button'], " +
@@ -1685,11 +1967,11 @@ namespace Proje.Service
         {
             try
             {
-                // Tarih inputlarını bul
                 var dateInputs = await _page.QuerySelectorAllAsync(
                     "input[type='date'], " +
                     "input[placeholder*='Tarih'], " +
-                    "input[placeholder*='Date']");
+                    "input[placeholder*='Date'], " +
+                    "input[type='datetime-local']");
 
                 foreach (var input in dateInputs)
                 {

@@ -6,6 +6,8 @@ using Proje.Service;
 using System;
 using System.Drawing;
 using System.Windows.Forms;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace Proje.Destop
 {
@@ -19,9 +21,11 @@ namespace Proje.Destop
         private Button _btnConnectionTest, _btnStartAutomation, _btnRestart, _btnExit, _btnExport;
         private RichTextBox _rtbLog;
         private ProgressBar _progressBar;
-        private Label _lblStatus;
-        private Panel _controlPanel, _logPanel;
+        private Label _lblStatus, _lblDate, _lblSort;
+        private Panel _controlPanel, _logPanel, _filterPanel;
         private TableLayoutPanel _mainLayout;
+        private DateTimePicker _dateTimePicker;
+        private ComboBox _comboSort;
 
         public MainForm()
         {
@@ -58,25 +62,93 @@ namespace Proje.Destop
         private void SetupUI()
         {
             this.Text = "PowerHavale İşlem Otomasyonu";
-            this.Size = new Size(1000, 700);
+            this.Size = new Size(1100, 750);
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.MinimumSize = new Size(900, 600);
+            this.MinimumSize = new Size(1000, 650);
 
             // Ana layout
             _mainLayout = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 3,
+                RowCount = 4,
                 Padding = new Padding(10),
                 BackColor = Color.White
             };
 
+            _mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 15));  // Filtre paneli
             _mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 20));  // Kontrol paneli
-            _mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 60));  // Log paneli
-            _mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 20));  // Alt butonlar
+            _mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 50));  // Log paneli
+            _mainLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 15));  // Alt butonlar
 
-            // 1. KONTROL PANELİ (Bağlantı Testi ve Otomasyon Butonları)
+            // 1. FİLTRE PANELİ
+            _filterPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(245, 249, 252),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            var filterTable = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 4,
+                RowCount = 2,
+                Padding = new Padding(15)
+            };
+
+            filterTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+            filterTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+            filterTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+            filterTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+
+            // Tarih Seçimi
+            _lblDate = new Label
+            {
+                Text = "Tarih ve Saat Seçimi:",
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                ForeColor = Color.FromArgb(52, 73, 94),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Dock = DockStyle.Fill
+            };
+
+            _dateTimePicker = new DateTimePicker
+            {
+                Font = new Font("Segoe UI", 10),
+                Format = DateTimePickerFormat.Custom,
+                CustomFormat = "dd/MM/yyyy HH:mm",
+                Dock = DockStyle.Fill,
+                Margin = new Padding(5)
+            };
+
+            // Sıralama Seçimi
+            _lblSort = new Label
+            {
+                Text = "Sıralama:",
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                ForeColor = Color.FromArgb(52, 73, 94),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Dock = DockStyle.Fill
+            };
+
+            _comboSort = new ComboBox
+            {
+                Font = new Font("Segoe UI", 10),
+                Dock = DockStyle.Fill,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Margin = new Padding(5)
+            };
+            _comboSort.Items.AddRange(new[] { "Eskiden Yeniye", "Yeniden Eskiye" });
+            _comboSort.SelectedIndex = 0;
+
+            filterTable.Controls.Add(_lblDate, 0, 0);
+            filterTable.Controls.Add(_dateTimePicker, 1, 0);
+            filterTable.Controls.Add(_lblSort, 2, 0);
+            filterTable.Controls.Add(_comboSort, 3, 0);
+
+            _filterPanel.Controls.Add(filterTable);
+
+            // 2. KONTROL PANELİ (Bağlantı Testi ve Otomasyon Butonları)
             _controlPanel = new Panel
             {
                 Dock = DockStyle.Fill,
@@ -86,7 +158,7 @@ namespace Proje.Destop
             var controlTable = new TableLayoutPanel
             {
                 Dock = DockStyle.Fill,
-                ColumnCount = 4,
+                ColumnCount = 5,
                 RowCount = 1,
                 Padding = new Padding(20)
             };
@@ -96,10 +168,10 @@ namespace Proje.Destop
                 Color.FromArgb(52, 152, 219), Color.White);
             _btnConnectionTest.Click += async (s, e) => await TestConnectionAsync();
 
-            // Otomasyon Başlat Butonu
+            // Otomasyon Başlat/Durdur Butonu
             _btnStartAutomation = CreateButton("▶️ OTOMASYONU BAŞLAT",
                 Color.FromArgb(46, 204, 113), Color.White);
-            _btnStartAutomation.Click += async (s, e) => await StartAutomationAsync();
+            _btnStartAutomation.Click += async (s, e) => await ToggleAutomationAsync();
 
             // Export Butonu
             _btnExport = CreateButton("📊 EXCEL EXPORT",
@@ -116,14 +188,18 @@ namespace Proje.Destop
                 Dock = DockStyle.Fill
             };
 
+            // Boş panel (dengeli görünüm için)
+            var emptyPanel = new Panel { Dock = DockStyle.Fill };
+
             controlTable.Controls.Add(_btnConnectionTest, 0, 0);
             controlTable.Controls.Add(_btnStartAutomation, 1, 0);
             controlTable.Controls.Add(_btnExport, 2, 0);
             controlTable.Controls.Add(_lblStatus, 3, 0);
+            controlTable.Controls.Add(emptyPanel, 4, 0);
 
             _controlPanel.Controls.Add(controlTable);
 
-            // 2. LOG PANELİ (Gelişmiş Log Ekranı)
+            // 3. LOG PANELİ (Gelişmiş Log Ekranı)
             _logPanel = new Panel
             {
                 Dock = DockStyle.Fill,
@@ -154,7 +230,7 @@ namespace Proje.Destop
             _logPanel.Controls.Add(_rtbLog);
             _logPanel.Controls.Add(logHeader);
 
-            // 3. ALT BUTON PANELİ (Yeniden Başlat/Kapat)
+            // 4. ALT BUTON PANELİ (Yeniden Başlat/Kapat)
             var bottomPanel = new Panel
             {
                 Dock = DockStyle.Fill,
@@ -194,9 +270,10 @@ namespace Proje.Destop
             bottomPanel.Controls.Add(bottomTable);
 
             // Ana panele ekle
-            _mainLayout.Controls.Add(_controlPanel, 0, 0);
-            _mainLayout.Controls.Add(_logPanel, 0, 1);
-            _mainLayout.Controls.Add(bottomPanel, 0, 2);
+            _mainLayout.Controls.Add(_filterPanel, 0, 0);
+            _mainLayout.Controls.Add(_controlPanel, 0, 1);
+            _mainLayout.Controls.Add(_logPanel, 0, 2);
+            _mainLayout.Controls.Add(bottomPanel, 0, 3);
 
             this.Controls.Add(_mainLayout);
         }
@@ -220,10 +297,8 @@ namespace Proje.Destop
 
         private void ApplyCorporateDesign()
         {
-            // Kurumsal renk paleti
             this.BackColor = Color.White;
 
-            // Buton hover efektleri
             foreach (Control control in GetAllControls(this))
             {
                 if (control is Button btn)
@@ -303,42 +378,50 @@ namespace Proje.Destop
             }
         }
 
-        // 2. OTOMASYON METODU (Güncellendi)
-        private async Task StartAutomationAsync()
+        // 2. OTOMASYON TOGGLE METODU (Başlat/Durdur)
+        private async Task ToggleAutomationAsync()
         {
             try
             {
-                AddLog("Otomasyon başlatılıyor...", LogType.Info);
-                _progressBar.Visible = true;
-                _progressBar.Value = 0;
-                _btnStartAutomation.Enabled = false;
-
-                // Web servisini başlat
-                await _webService.InitializeAsync();
-                _progressBar.Value = 20;
-                AddLog("Playwright başlatıldı", LogType.Info);
-
-                // Login işlemi
-                AddLog("Login işlemi yapılıyor...", LogType.Info);
-                _progressBar.Value = 40;
-
-                // Otomasyonu çalıştır
-                var success = await _transactionManager.ExecuteFullAutomationAsync(
-                    @"C:\PowerHavale\İşlemler.xlsx", 5);
-
-                _progressBar.Value = 100;
-
-                if (success)
+                if (_transactionManager.IsContinuousProcessingRunning())
                 {
-                    AddLog("✓ Otomasyon başarıyla tamamlandı!", LogType.Success);
-                    _lblStatus.Text = "Otomasyon Tamamlandı";
-                    _lblStatus.ForeColor = Color.FromArgb(46, 204, 113);
+                    // Otomasyon durduruluyor
+                    _transactionManager.StopContinuousProcessing();
+                    _btnStartAutomation.Text = "▶️ OTOMASYONU BAŞLAT";
+                    _btnStartAutomation.BackColor = Color.FromArgb(46, 204, 113);
+                    _lblStatus.Text = "Otomasyon Durduruldu";
+                    _lblStatus.ForeColor = Color.Orange;
+                    AddLog("Otomasyon durduruldu.", LogType.Warning);
                 }
                 else
                 {
-                    AddLog("✗ Otomasyon sırasında hata oluştu!", LogType.Error);
-                    _lblStatus.Text = "Otomasyon Hatası";
-                    _lblStatus.ForeColor = Color.Red;
+                    // Otomasyon başlatılıyor
+                    AddLog("Otomasyon başlatılıyor...", LogType.Info);
+                    _progressBar.Visible = true;
+                    _progressBar.Value = 0;
+                    _btnStartAutomation.Enabled = false;
+
+                    DateTime selectedDate = _dateTimePicker.Value;
+                    string sortOrder = _comboSort.SelectedItem.ToString();
+
+                    AddLog($"Filtreler: Tarih={selectedDate:dd/MM/yyyy HH:mm}, Sıralama={sortOrder}", LogType.Info);
+
+                    // Web servisini başlat
+                    await _webService.InitializeAsync();
+                    _progressBar.Value = 20;
+                    AddLog("Playwright başlatıldı", LogType.Info);
+
+                    // Sürekli işlem döngüsünü başlat
+                    _transactionManager.StartContinuousProcessing(
+                        selectedDate: selectedDate,
+                        sortOrder: sortOrder);
+
+                    _progressBar.Value = 100;
+                    _btnStartAutomation.Text = "⏹️ OTOMASYONU DURDUR";
+                    _btnStartAutomation.BackColor = Color.FromArgb(231, 76, 60);
+                    _lblStatus.Text = "Otomasyon Çalışıyor";
+                    _lblStatus.ForeColor = Color.FromArgb(46, 204, 113);
+                    AddLog("✓ Otomasyon başlatıldı! Sürekli döngü başladı.", LogType.Success);
                 }
             }
             catch (Exception ex)
